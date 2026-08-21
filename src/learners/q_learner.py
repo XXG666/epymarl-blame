@@ -103,11 +103,24 @@ class QLearner:
         else:
             target_max_qvals = target_mac_out.max(dim=3)[0]
 
-        # Mix
+        """
+        Mixer, keep a pointer on the per-agent Q-value BEFORE the mixer as 
+        the mixer call below rebinds `chosen_action_qvals` to Q_tot
+        """
+        q_agents = chosen_action_qvals  # (batch, time, n_agents)
+        q_agents_cut = None
         if self.mixer is not None:
-            chosen_action_qvals = self.mixer(
-                chosen_action_qvals, batch["state"][:, :-1]
-            )
+            if getattr(self.args, "split_backward", False):
+                # THE CUT: a fresh leaf that will collect dL/dQ_a
+                q_agents_cut = q_agents.detach().requires_grad_(True)
+                """
+                Detached tensor to feed forward to the mixer, the backward will be done 
+                on this tensor, and the gradient will stop here since it is detached.
+                """
+                mixer_in = q_agents_cut
+            else:
+                mixer_in = q_agents
+            chosen_action_qvals = self.mixer(mixer_in, batch["state"][:, :-1])
             target_max_qvals = self.target_mixer(
                 target_max_qvals, batch["state"][:, 1:]
             )
@@ -127,9 +140,12 @@ class QLearner:
             targets = (targets - self.ret_ms.mean) / th.sqrt(self.ret_ms.var)
 
         # Td-error
-        td_error = chosen_action_qvals - targets.detach()
-
+        td_error = chosen_action_qvals - targets.detach() #TODO
         mask = mask.expand_as(td_error)
+        #TODO run with/without split_backward to see if they perform the same, and if the gradient is the same. If not, then we have a bug in the backward pass.
+                
+        #TODO stage 0 introduce the blame head set gradient to 0, and then combine with the mixer gradient, and then backpropagate to the agent networks. 
+        #TODO stage 1 create a new loss/mixer for the blame head, combine the blame head loss with the mixer loss, and then backpropagate to the agent networks.
 
         # 0-out the targets that came from padded data
         masked_td_error = td_error * mask
@@ -139,7 +155,19 @@ class QLearner:
 
         # Optimise
         self.optimiser.zero_grad()
-        loss.backward()
+        if q_agents_cut is not None:
+            # loss -> mixer, stops at the cut
+            loss.backward()
+            dL_dQa = q_agents_cut.grad
+            assert dL_dQa is not None, "ERROR: cut received no gradient - check the graph"
+
+            # ------------------- INTERRUPT -------------------
+            self._inspect_agent_grads(dL_dQa, mask, t_env)
+
+            # resume, pushing dL/dQ_a into the agent networks using the pointer (q_agents) we create in forward ---
+            q_agents.backward(gradient=dL_dQa)
+        else:
+            loss.backward()
         grad_norm = th.nn.utils.clip_grad_norm_(self.params, self.args.grad_norm_clip)
         self.optimiser.step()
 
@@ -174,6 +202,18 @@ class QLearner:
                 t_env,
             )
             self.log_stats_t = t_env
+
+    def _inspect_agent_grads(self, dL_dQa, mask, t_env):
+        """M2 interrupt point. dL_dQa[b, t, a] = dL/dQ_a for agent a at (b, t)."""
+        if t_env - self.log_stats_t < self.args.learner_log_interval:
+            return
+        with th.no_grad():
+            m = mask[..., :1]  # (batch, time, 1)
+            per_agent = (dL_dQa.abs() * m).sum(dim=(0, 1)) / m.sum().clamp(min=1)
+            self.logger.console_logger.info(
+                "[M2] mean |dL/dQ_a| per agent: "
+                + " ".join(f"{v:.3e}" for v in per_agent.tolist())
+            )
 
     def _update_targets_hard(self):
         self.target_mac.load_state(self.mac)
