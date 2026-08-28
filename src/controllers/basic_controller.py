@@ -20,6 +20,8 @@ class BasicMAC:
         # Only select actions for the selected batch elements in bs
         avail_actions = ep_batch["avail_actions"][:, t_ep]
         agent_outputs = self.forward(ep_batch, t_ep, test_mode=test_mode)
+        # Stage 0: only the Q half takes part in action selection
+        agent_outputs = agent_outputs[..., : self.args.n_actions]
         chosen_actions = self.action_selector.select_action(agent_outputs[bs], avail_actions[bs], t_env, test_mode=test_mode)
         return chosen_actions
 
@@ -28,14 +30,25 @@ class BasicMAC:
         avail_actions = ep_batch["avail_actions"][:, t]
         agent_outs, self.hidden_states = self.agent(agent_inputs, self.hidden_states)
 
+        # --- Stage 0: split [ Q | B ] so that normalisation touches Q only ---
+        n_blame = getattr(self.args, "n_blame_outputs", 0)
+        if n_blame > 0:
+            q_outs, b_outs = agent_outs[:, :-n_blame], agent_outs[:, -n_blame:]
+        else:
+            q_outs, b_outs = agent_outs, None
+
         # Softmax the agent outputs if they're policy logits
         if self.agent_output_type == "pi_logits":
-
             if getattr(self.args, "mask_before_softmax", True):
                 # Make the logits for unavailable actions very negative to minimise their affect on the softmax
                 reshaped_avail_actions = avail_actions.reshape(ep_batch.batch_size * self.n_agents, -1)
-                agent_outs[reshaped_avail_actions == 0] = -1e10
-            agent_outs = th.nn.functional.softmax(agent_outs, dim=-1)
+                q_outs = q_outs.masked_fill(reshaped_avail_actions == 0, -1e10)
+            q_outs = th.nn.functional.softmax(q_outs, dim=-1)
+            #TODO the qmix does not need softmax, only policy networks do, but our algorithm is based only on qmix so the on policy algorithm should not have mixed tensor at all.
+        if b_outs is not None:
+            agent_outs = th.cat([q_outs, b_outs], dim=-1)
+        else:
+            agent_outs = q_outs
 
         return agent_outs.view(ep_batch.batch_size, self.n_agents, -1)
 

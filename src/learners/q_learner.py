@@ -75,8 +75,17 @@ class QLearner:
             agent_outs = self.mac.forward(batch, t=t)
             mac_out.append(agent_outs)
         mac_out = th.stack(mac_out, dim=1)  # Concat over time
+
+        # --- Stage 0: split the combined [ Q | B ] output ---
+        n_blame = getattr(self.args, "n_blame_outputs", 0)
+        if n_blame > 0:
+            q_out = mac_out[..., :-n_blame]
+            b_out = mac_out[..., -n_blame:]  
+        else:
+            q_out = mac_out
+
         # Pick the Q-Values for the actions taken by each agent
-        chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(
+        chosen_action_qvals = th.gather(q_out[:, :-1], dim=3, index=actions).squeeze(
             3
         )  # Remove the last dim
 
@@ -89,6 +98,8 @@ class QLearner:
 
         # We don't need the first timesteps Q-Value estimate for calculating targets
         target_mac_out = th.stack(target_mac_out[1:], dim=1)  # Concat across time
+        if n_blame > 0:
+            target_mac_out = target_mac_out[..., :-n_blame]  # Stage 0: Q half only
 
         # Mask out unavailable actions
         target_mac_out[avail_actions[:, 1:] == 0] = -9999999
@@ -96,7 +107,7 @@ class QLearner:
         # Max over target Q-Values
         if self.args.double_q:
             # Get actions that maximise live Q (for double q-learning)
-            mac_out_detach = mac_out.clone().detach()
+            mac_out_detach = q_out.clone().detach()
             mac_out_detach[avail_actions == 0] = -9999999
             cur_max_actions = mac_out_detach[:, 1:].max(dim=3, keepdim=True)[1]
             target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3)
@@ -142,9 +153,7 @@ class QLearner:
         # Td-error
         td_error = chosen_action_qvals - targets.detach() #TODO
         mask = mask.expand_as(td_error)
-        #TODO run with/without split_backward to see if they perform the same, and if the gradient is the same. If not, then we have a bug in the backward pass.
-                
-        #TODO stage 0 introduce the blame head set gradient to 0, and then combine with the mixer gradient, and then backpropagate to the agent networks. 
+        
         #TODO stage 1 create a new loss/mixer for the blame head, combine the blame head loss with the mixer loss, and then backpropagate to the agent networks.
 
         # 0-out the targets that came from padded data
@@ -165,7 +174,23 @@ class QLearner:
             self._inspect_agent_grads(dL_dQa, mask, t_env)
 
             # resume, pushing dL/dQ_a into the agent networks using the pointer (q_agents) we create in forward ---
-            q_agents.backward(gradient=dL_dQa)
+            if n_blame > 0:
+                # --- Stage 0: build the expanded gradient explicitly ---
+                full_grad = th.zeros_like(mac_out) # q + b
+
+                """
+                Batch, Time, Agents, Actions
+                full_grad[b][t][a][ actions[b][t][a][0] ]  =  dL_dQa[b][t][a][0]
+                          ▲  ▲  ▲    ▲
+                          │  │  │    └── comes from the INDEX
+                          └──┴──┴─────── come straight from the position
+                """
+                full_grad[:, :-1, :, : self.args.n_actions].scatter_(
+                    3, actions, dL_dQa.unsqueeze(3) # "=" assign the value
+)
+                mac_out.backward(gradient=full_grad)
+            else:
+                q_agents.backward(gradient=dL_dQa)
         else:
             loss.backward()
         grad_norm = th.nn.utils.clip_grad_norm_(self.params, self.args.grad_norm_clip)

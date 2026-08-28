@@ -57,3 +57,6 @@ hypergroup: null
 
 # --- interrupt/resume in backpropagation ---
 split_backward: False # Cut the autograd graph at the per-agent utilities
+
+# --- Blame head options ---
+blame_head: False # Stage 0: give each agent a B head alongside its Q head
