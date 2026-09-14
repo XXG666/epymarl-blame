@@ -60,3 +60,4 @@ split_backward: False # Cut the autograd graph at the per-agent utilities
 
 # --- Blame head options ---
 blame_head: False # Stage 0: give each agent a B head alongside its Q head
+blame_head_rng_match: True # Match the RNG state when initializing the blame head
