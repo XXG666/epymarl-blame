@@ -2,6 +2,7 @@ import copy
 
 import torch as th
 from torch.optim import Adam
+import torch.nn.functional as F
 
 from components.episode_buffer import EpisodeBatch
 from components.standarize_stream import RunningMeanStd
@@ -188,7 +189,11 @@ class QLearner:
                 full_grad[:, :-1, :, : self.args.n_actions].scatter_(
                     3, actions, dL_dQa.unsqueeze(3) # "=" assign the value
 )
-                mac_out.backward(gradient=full_grad)
+                # --- Stage 1: who is to blame, read from the interrupted signal ---
+                blame_target = self._blame_target(dL_dQa.detach())   # (batch, time, n_agents), 0/1
+                blame_loss = self._blame_loss(mac_out[:, :-1, :, self.args.n_actions :], blame_target, mask, t_env)
+                # resume: autograd adds the TD gradient (full_grad) and the blame loss's gradient, one pass
+                th.autograd.backward([mac_out, blame_loss], [full_grad, None])
             else:
                 q_agents.backward(gradient=dL_dQa)
         else:
@@ -239,6 +244,44 @@ class QLearner:
                 "[M2] mean |dL/dQ_a| per agent: "
                 + " ".join(f"{v:.3e}" for v in per_agent.tolist())
             )
+
+    def _blame_target(self, dL_dQa):
+        """
+        Stage 1 target: 1 for the agent with the largest dL/dQ_a at steps where the team
+        overestimated (Q_tot > y, so dL/dQ_a > 0); all 0 where it did as well or better
+        than predicted, and at padded steps (dL/dQ_a = 0 there).
+        """
+        overestimated = dL_dQa.max(dim=-1, keepdim=True).values > 0                  # (batch, time, 1)
+        most = F.one_hot(dL_dQa.argmax(dim=-1), num_classes=dL_dQa.size(-1)).float()  # (batch, time, n_agents)
+        return most * overestimated
+
+    def _blame_loss(self, b, blame_target, mask, t_env):
+        """Stage 1: per-agent yes/no loss between B (logits) and the 0/1 target, over real steps."""
+        real = mask[..., 0] > 0                                  # (batch, time): True = real step
+        target = blame_target.unsqueeze(2).expand_as(b)          # every agent guesses the same 0/1 vector
+        blame_loss = F.binary_cross_entropy_with_logits(b[real], target[real])
+
+        if t_env - self.log_stats_t >= self.args.learner_log_interval:
+            with th.no_grad():
+                t_real, b_real = target[real], b[real]
+                rate = t_real.mean().clamp(1e-6, 1 - 1e-6)       # constant guess: every agent, the batch blame rate
+                self.logger.log_stat("blame_loss", blame_loss.item(), t_env)
+                self.logger.log_stat("blame_loss_const", F.binary_cross_entropy(rate.expand_as(t_real), t_real).item(), t_env)
+                self.logger.log_stat("blame_accuracy", ((b_real > 0).float() == t_real).all(dim=-1).float().mean().item(), t_env)
+                self.logger.log_stat("blame_step_rate", blame_target[mask[..., 0] > 0].sum(dim=-1).mean().item(), t_env)
+
+                # whether: is this a blame step?  (largest probability > 0.5  vs  target has a 1)
+                p = th.sigmoid(b_real)                           # (real steps, guessing agent, n_agents)
+                is_blame = t_real.sum(-1) > 0                    # (real steps, guessing agent)
+                share = is_blame.float().mean()
+                self.logger.log_stat("blame_whether_acc", ((p.max(-1).values > 0.5) == is_blame).float().mean().item(), t_env)
+                self.logger.log_stat("blame_whether_base", th.maximum(share, 1 - share).item(), t_env)  # always the majority answer
+                # who: at blame steps, is the most likely agent the blamed one?
+                if is_blame.any():
+                    blamed = t_real[is_blame]                    # (blame steps, n_agents), one-hot
+                    self.logger.log_stat("blame_who_acc", (p.argmax(-1)[is_blame] == blamed.argmax(-1)).float().mean().item(), t_env)
+                    self.logger.log_stat("blame_who_base", (blamed.sum(0).max() / blamed.size(0)).item(), t_env)  # always the most-blamed agent
+        return blame_loss
 
     def _update_targets_hard(self):
         self.target_mac.load_state(self.mac)
