@@ -44,7 +44,6 @@ class BasicMAC:
                 reshaped_avail_actions = avail_actions.reshape(ep_batch.batch_size * self.n_agents, -1)
                 q_outs = q_outs.masked_fill(reshaped_avail_actions == 0, -1e10)
             q_outs = th.nn.functional.softmax(q_outs, dim=-1)
-            #TODO the qmix does not need softmax, only policy networks do, but our algorithm is based only on qmix so the on policy algorithm should not have mixed tensor at all.
         if b_outs is not None:
             agent_outs = th.cat([q_outs, b_outs], dim=-1)
         else:

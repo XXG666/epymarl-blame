@@ -152,11 +152,9 @@ class QLearner:
             targets = (targets - self.ret_ms.mean) / th.sqrt(self.ret_ms.var)
 
         # Td-error
-        td_error = chosen_action_qvals - targets.detach() #TODO
+        td_error = chosen_action_qvals - targets.detach()
         mask = mask.expand_as(td_error)
         
-        #TODO stage 1 create a new loss/mixer for the blame head, combine the blame head loss with the mixer loss, and then backpropagate to the agent networks.
-
         # 0-out the targets that came from padded data
         masked_td_error = td_error * mask
 
@@ -172,7 +170,6 @@ class QLearner:
             assert dL_dQa is not None, "ERROR: cut received no gradient - check the graph"
 
             # ------------------- INTERRUPT -------------------
-            self._inspect_agent_grads(dL_dQa, mask, t_env)
 
             # resume, pushing dL/dQ_a into the agent networks using the pointer (q_agents) we create in forward ---
             if n_blame > 0:
@@ -232,18 +229,6 @@ class QLearner:
                 t_env,
             )
             self.log_stats_t = t_env
-
-    def _inspect_agent_grads(self, dL_dQa, mask, t_env):
-        """M2 interrupt point. dL_dQa[b, t, a] = dL/dQ_a for agent a at (b, t)."""
-        if t_env - self.log_stats_t < self.args.learner_log_interval:
-            return
-        with th.no_grad():
-            m = mask[..., :1]  # (batch, time, 1)
-            per_agent = (dL_dQa.abs() * m).sum(dim=(0, 1)) / m.sum().clamp(min=1)
-            self.logger.console_logger.info(
-                "[M2] mean |dL/dQ_a| per agent: "
-                + " ".join(f"{v:.3e}" for v in per_agent.tolist())
-            )
 
     def _blame_target(self, dL_dQa):
         """
