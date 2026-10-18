@@ -47,6 +47,8 @@ RESUME, HONESTLY
     checkpoint's step (up to 100k steps before the stop are redone). It does not save the replay
     buffer, which refills first, nor the target mixer, which restarts from its initial weights.
     A resumed job is close to, but not bit-identical with, one that never stopped; it is marked "r".
+    resume --from-scratch starts the job again at step 0: identical to a job that never stopped, so
+    it is not marked, and only the new attempt's results count.
     Resume refuses if the training code (src/) changed since the run started (--force overrides).
 
 USAGE
@@ -215,6 +217,19 @@ def job_state(rec, kind, alive):
     return ("crashed" if "Traceback" in text else "stopped"), t, len(attempts)
 
 
+def counted_attempts(rec, kind):
+    """The attempts whose results count: the latest one that started at step 0 and every one after it.
+    A restart from scratch (resume --from-scratch) replaces everything before it."""
+    attempts = rec["attempts"][kind]
+    first = max((i for i, att in enumerate(attempts) if att["start_t"] == 0), default=0)
+    return attempts[first:]
+
+
+def resumed(rec, kind):
+    """True if the job's counted results include an attempt that continued from a checkpoint."""
+    return any(att["start_t"] > 0 for att in counted_attempts(rec, kind))
+
+
 def latest_checkpoint(run_id, kind):
     """(checkpoint directory, t_env) of the job's newest complete checkpoint, or None."""
     best = None
@@ -281,10 +296,10 @@ def cmd_run(a):
     print(f"follow it with:  run_long.py status {run_id}")
 
 
-def job_cell(status, t, n, t_max):
+def job_cell(status, t, t_max, was_resumed):
     """A job's state in one short cell, e.g. 'running 37%', 'done', 'stopped 45% r'."""
     pct = "" if status in ("done", "not started") else f" {min(100, t * 100 // t_max)}%"
-    return status + pct + (" r" if n > 1 else "")
+    return status + pct + (" r" if was_resumed else "")
 
 
 def cmd_list(a):
@@ -297,7 +312,7 @@ def cmd_list(a):
         w = max(8, max(len(r["id"]) for r in recs) + 2)
         print(f"   {'id':<{w}}{'created':<18}{'seed':>5}{'t_max':>12}   {'qmix':<16}{'blame':<16}{'commit':<10}note")
         for rec in recs:
-            qmix, blame = (job_cell(*job_state(rec, kind, alive), rec["t_max"]) for kind in KINDS)
+            qmix, blame = (job_cell(*job_state(rec, kind, alive)[:2], rec["t_max"], resumed(rec, kind)) for kind in KINDS)
             print(f"   {rec['id']:<{w}}{rec['created']:<18}{rec['seed']:>5}{rec['t_max']:>12,}   "
                   f"{qmix:<16}{blame:<16}{rec['commit'] + ('*' if rec['dirty'] else ''):<10}{rec['note']}")
         print("\n   r = resumed from a checkpoint;  commit* = started with uncommitted changes in src/")
@@ -425,9 +440,9 @@ def cmd_delete(a):
 # summary
 # ----------------------------------------------------------------------------------
 def job_metrics(rec, kind):
-    """The job's metrics, stitched over its attempts: attempt k contributes its values from its own
-    start step up to (not including) the step the next attempt resumed from."""
-    attempts = rec["attempts"][kind]
+    """The job's metrics, stitched over its counted attempts: attempt k contributes its values from its
+    own start step up to (not including) the step the next attempt resumed from."""
+    attempts = counted_attempts(rec, kind)
     merged = {}
     for i, att in enumerate(attempts):
         path = attempt_log(rec["id"], kind, att["n"])
@@ -500,9 +515,10 @@ def run_result(rec, alive):
     """Both jobs of a run: reached, mark and return of each; the blame head's metrics; the stitched metrics."""
     res = {"rec": rec, "marks": set(), "metrics": {}}
     for kind in KINDS:
-        status, t, n = job_state(rec, kind, alive)
+        status, t, _ = job_state(rec, kind, alive)
         m = job_metrics(rec, kind)
-        mark = ("*" if status == "running" else "") + ("r" if n > 1 else "") + ("!" if status in ("crashed", "stopped") else "")
+        mark = (("*" if status == "running" else "") + ("r" if resumed(rec, kind) else "")
+                + ("!" if status in ("crashed", "stopped") else ""))
         res["marks"] |= set(mark)
         res["metrics"][kind] = m
         res[kind] = {"t": t, "mark": mark, "return": late_mean(m, "test_return_mean", t // 2)}
