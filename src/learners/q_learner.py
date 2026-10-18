@@ -187,7 +187,7 @@ class QLearner:
                     3, actions, dL_dQa.unsqueeze(3) # "=" assign the value
 )
                 # --- Stage 1: who is to blame, read from the interrupted signal ---
-                blame_target = self._blame_target(dL_dQa.detach())   # (batch, time, n_agents), 0/1
+                blame_target = self._blame_target(dL_dQa.detach())
                 blame_loss = self._blame_loss(mac_out[:, :-1, :, self.args.n_actions :], blame_target, mask, t_env)
                 # resume: autograd adds the TD gradient (full_grad) and the blame loss's gradient, one pass
                 th.autograd.backward([mac_out, blame_loss], [full_grad, None])
@@ -232,40 +232,53 @@ class QLearner:
 
     def _blame_target(self, dL_dQa):
         """
-        Stage 1 target: 1 for the agent with the largest dL/dQ_a at steps where the team
-        overestimated (Q_tot > y, so dL/dQ_a > 0); all 0 where it did as well or better
-        than predicted, and at padded steps (dL/dQ_a = 0 there).
+        Stage 1 target, one choice among n + 1 per step: [agent 1, ..., agent n, nobody].
+        If the team did worse than predicted (Q_tot > y, so dL/dQ_a > 0), the agent with the
+        largest dL/dQ_a gets the 1; otherwise "nobody" gets it (also at padded steps).
         """
-        overestimated = dL_dQa.max(dim=-1, keepdim=True).values > 0                  # (batch, time, 1)
-        most = F.one_hot(dL_dQa.argmax(dim=-1), num_classes=dL_dQa.size(-1)).float()  # (batch, time, n_agents)
-        return most * overestimated
+        agents = F.one_hot(dL_dQa.argmax(-1), dL_dQa.size(-1)).float() * (dL_dQa > 0)   # (batch, time, n_agents)
+        nobody = 1 - agents.sum(-1, keepdim=True)                                          # (batch, time, 1)
+        return th.cat([agents, nobody], dim=-1)                                            # (batch, time, n_agents + 1)
 
     def _blame_loss(self, b, blame_target, mask, t_env):
-        """Stage 1: per-agent yes/no loss between B (logits) and the 0/1 target, over real steps."""
+        """Stage 1: one choice among n + 1 (each agent, or nobody): cross-entropy between B (logits) and the one-hot target, over real steps."""
         real = mask[..., 0] > 0                                  # (batch, time): True = real step
-        target = blame_target.unsqueeze(2).expand_as(b)          # every agent guesses the same 0/1 vector
-        blame_loss = F.binary_cross_entropy_with_logits(b[real], target[real])
+        target = blame_target.unsqueeze(2).expand_as(b)          # every agent guesses the same one-hot vector
+        n_choices = b.size(-1)                                   # n agents + "nobody"
+        blame_loss = F.cross_entropy(b[real].reshape(-1, n_choices), target[real].reshape(-1, n_choices))
 
         if t_env - self.log_stats_t >= self.args.learner_log_interval:
             with th.no_grad():
-                t_real, b_real = target[real], b[real]
-                rate = t_real.mean().clamp(1e-6, 1 - 1e-6)       # constant guess: every agent, the batch blame rate
-                self.logger.log_stat("blame_loss", blame_loss.item(), t_env)
-                self.logger.log_stat("blame_loss_const", F.binary_cross_entropy(rate.expand_as(t_real), t_real).item(), t_env)
-                self.logger.log_stat("blame_accuracy", ((b_real > 0).float() == t_real).all(dim=-1).float().mean().item(), t_env)
-                self.logger.log_stat("blame_step_rate", blame_target[mask[..., 0] > 0].sum(dim=-1).mean().item(), t_env)
+                p = th.softmax(b[real], dim=-1)                   # (real steps, guessing agent, n_choices): probabilities
+                guess = p.argmax(-1)                              # (real steps, guessing agent): each agent's choice
+                truth = blame_target[real].argmax(-1)             # (real steps,): the correct choice
+                nobody = n_choices - 1                            # the last choice is "nobody"
 
-                # whether: is this a blame step?  (largest probability > 0.5  vs  target has a 1)
-                p = th.sigmoid(b_real)                           # (real steps, guessing agent, n_agents)
-                is_blame = t_real.sum(-1) > 0                    # (real steps, guessing agent)
+                # lazy strategy: always give the most common correct choice of this batch
+                freq = th.bincount(truth, minlength=n_choices).float() / truth.numel()
+
+                # team vote: the choice with the most votes; ties broken by the agents' summed probabilities
+                votes = F.one_hot(guess, n_choices).sum(1)                     # (real steps, n_choices)
+                tied = votes == votes.max(-1, keepdim=True).values             # the choices with the most votes
+                vote = th.where(tied, p.sum(1), -1.0).argmax(-1)               # among those, the most believed
+
+                # whether: blame step or not;  who: at blame steps, the most likely agent (ignoring "nobody")
+                is_blame = truth != nobody
                 share = is_blame.float().mean()
-                self.logger.log_stat("blame_whether_acc", ((p.max(-1).values > 0.5) == is_blame).float().mean().item(), t_env)
-                self.logger.log_stat("blame_whether_base", th.maximum(share, 1 - share).item(), t_env)  # always the majority answer
-                # who: at blame steps, is the most likely agent the blamed one?
+
+                log = self.logger.log_stat
+                log("blame_loss", blame_loss.item(), t_env)
+                log("blame_loss_const", -(freq[freq > 0] * freq[freq > 0].log()).sum().item(), t_env)
+                log("blame_acc", (guess == truth.unsqueeze(1)).float().mean().item(), t_env)
+                log("blame_vote_acc", (vote == truth).float().mean().item(), t_env)
+                log("blame_base", freq.max().item(), t_env)
+                log("blame_step_rate", share.item(), t_env)
+                log("blame_whether_acc", ((guess != nobody) == is_blame.unsqueeze(1)).float().mean().item(), t_env)
+                log("blame_whether_base", th.maximum(share, 1 - share).item(), t_env)
                 if is_blame.any():
-                    blamed = t_real[is_blame]                    # (blame steps, n_agents), one-hot
-                    self.logger.log_stat("blame_who_acc", (p.argmax(-1)[is_blame] == blamed.argmax(-1)).float().mean().item(), t_env)
-                    self.logger.log_stat("blame_who_base", (blamed.sum(0).max() / blamed.size(0)).item(), t_env)  # always the most-blamed agent
+                    blamed = truth[is_blame]                                   # the blamed agent, at blame steps
+                    log("blame_who_acc", (p[is_blame][..., :nobody].argmax(-1) == blamed.unsqueeze(1)).float().mean().item(), t_env)
+                    log("blame_who_base", (th.bincount(blamed, minlength=nobody).max() / blamed.numel()).item(), t_env)
         return blame_loss
 
     def _update_targets_hard(self):
