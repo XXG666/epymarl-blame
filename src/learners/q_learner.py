@@ -188,7 +188,8 @@ class QLearner:
 )
                 # --- Stage 1: who is to blame, read from the interrupted signal ---
                 blame_target = self._blame_target(dL_dQa.detach())
-                blame_loss = self._blame_loss(mac_out[:, :-1, :, self.args.n_actions :], blame_target, mask, t_env)
+                # the head judges step t AFTER seeing its outcome: its output at step t+1 (mac_out[:, 1:]) is trained on step t's blame
+                blame_loss = self._blame_loss(mac_out[:, 1:, :, self.args.n_actions :], blame_target, mask, t_env)
                 # resume: autograd adds the TD gradient (full_grad) and the blame loss's gradient, one pass
                 th.autograd.backward([mac_out, blame_loss], [full_grad, None])
             else:
@@ -273,7 +274,8 @@ class QLearner:
                 log("blame_vote_acc", (vote == truth).float().mean().item(), t_env)
                 log("blame_base", freq.max().item(), t_env)
                 log("blame_step_rate", share.item(), t_env)
-                log("blame_whether_acc", ((guess != nobody) == is_blame.unsqueeze(1)).float().mean().item(), t_env)
+                # yes/no: "someone" when P(someone) = 1 - P(nobody) > 0.5, not from the 4-way top choice
+                log("blame_whether_acc", ((p[..., nobody] < 0.5) == is_blame.unsqueeze(1)).float().mean().item(), t_env)
                 log("blame_whether_base", th.maximum(share, 1 - share).item(), t_env)
                 if is_blame.any():
                     blamed = truth[is_blame]                                   # the blamed agent, at blame steps
@@ -323,6 +325,9 @@ class QLearner:
                     map_location=lambda storage, loc: storage,
                 )
             )
+            # TEMP (not committed): start the target mixer from the loaded mixer, like target_mac above,
+            # instead of leaving it at its fresh initial weights after a resume
+            self.target_mixer.load_state_dict(self.mixer.state_dict())
         self.optimiser.load_state_dict(
             th.load("{}/opt.th".format(path), map_location=lambda storage, loc: storage)
         )
