@@ -45,7 +45,7 @@ COMMANDS
 RESUME, HONESTLY
     EPyMARL reloads the agent network, the mixer and Adam from the checkpoint and continues at the
     checkpoint's step (up to 100k steps before the stop are redone). It does not save the replay
-    buffer, which refills first, nor the target mixer, which restarts from its initial weights.
+    buffer, which refills first, nor the target mixer, which restarts from the loaded mixer.
     A resumed job is close to, but not bit-identical with, one that never stopped; it is marked "r".
     resume --from-scratch starts the job again at step 0: identical to a job that never stopped, so
     it is not marked, and only the new attempt's results count.
@@ -112,8 +112,9 @@ KINDS = {
     "blame": ["blame_head=True", "split_backward=True"],
 }
 
-# colours: blame QMIX in categorical slot 1, "each agent" slot 2, "team vote" slot 3; plain QMIX neutral grey
-C_BLUE, C_ORANGE, C_AQUA = "#2a78d6", "#eb6834", "#1baf7a"
+# colours: blame QMIX in categorical slot 1, then the blame head's questions in slots 2-5
+# ("each agent", "team vote", "who", "whether"); plain QMIX neutral grey
+C_BLUE, C_ORANGE, C_AQUA, C_YELLOW, C_MAGENTA = "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"
 C_REF, C_INK, C_GRID = "#8a8984", "#52514e", "#e1e0d9"
 LINE = {"qmix": (C_REF, "--", "benchmark QMIX"), "blame": (C_BLUE, "-", "blame QMIX")}
 
@@ -485,7 +486,8 @@ def mean(xs):
     return sum(xs) / len(xs) if xs else float("nan")
 
 
-BLAME_KEYS = ["blame_acc", "blame_vote_acc", "blame_base"]
+BLAME_KEYS = ["blame_acc", "blame_vote_acc", "blame_base",
+              "blame_who_acc", "blame_who_base", "blame_whether_acc", "blame_whether_base"]
 
 
 # the questions the blame head is scored on: (name in a run's summary, column in a summary of several runs,
@@ -493,11 +495,16 @@ BLAME_KEYS = ["blame_acc", "blame_vote_acc", "blame_base"]
 BLAME_ROWS = [
     ("choice, each agent", "each", "blame_acc", "blame_base"),
     ("choice, team vote", "vote", "blame_vote_acc", "blame_base"),
+    ("who", "who", "blame_who_acc", "blame_who_base"),
+    ("whether", "whether", "blame_whether_acc", "blame_whether_base"),
 ]
+BLAME_COLOUR = {"each": C_ORANGE, "vote": C_AQUA, "who": C_YELLOW, "whether": C_MAGENTA}
 LEGEND = [
     "   return   = test return (1.0 = all food collected); the paper's QMIX on this task: average 0.67, maximum 0.90",
     "   choice   = pick the right one of: agent 1, 2, 3 or nobody",
     "              each agent (each) = every agent's own pick;  team vote (vote) = the agents' majority vote",
+    "   who      = only at steps where someone is to blame: is the most likely agent the blamed one",
+    "   whether  = say \"someone\" or \"nobody\" right",
     "   base     = always give the most common answer (the lazy strategy)",
     "   gap      = acc - base: above 0 = beats lazy",
     "   share    = gap / (1 - base): 0% = lazy, 100% = perfect",
@@ -621,8 +628,8 @@ def cmd_summary(a):
 
 
 def plot(curves, path, title):
-    """Left: test return of every job. Right: each blame job's accuracy minus base, for each agent's choice and
-    the team vote. curves: {(run ID, job): metrics}."""
+    """Left: test return of every job. Right: each blame job's accuracy minus base, for every question in
+    BLAME_ROWS. curves: {(run ID, job): metrics}."""
     plt.rcParams.update({"axes.edgecolor": C_GRID, "axes.labelcolor": C_INK, "xtick.color": C_INK,
                          "ytick.color": C_INK, "axes.titlecolor": C_INK})
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.6), sharex=True)  # both panels: the same steps on the x axis
@@ -642,14 +649,13 @@ def plot(curves, path, title):
                      marker="o", markersize=2.5, label=legend_name(name))
         if kind != "blame":
             continue
-        for key, kc, acc_key, base_key in (("choice, each agent", C_ORANGE, "blame_acc", "blame_base"),
-                                           ("choice, team vote", C_AQUA, "blame_vote_acc", "blame_base")):
+        for name, col, acc_key, base_key in BLAME_ROWS:
             if acc_key not in m or base_key not in m:
                 continue
             base_at = dict(zip(m[base_key]["steps"], m[base_key]["values"]))
             pts = [(t, v - base_at[t]) for t, v in zip(m[acc_key]["steps"], m[acc_key]["values"]) if t in base_at]
-            ax2.plot([p[0] for p in pts], [p[1] for p in pts], color=kc, marker="o", markersize=2.5,
-                     linewidth=1.5, alpha=0.8, label=legend_name(f"{key}: accuracy − base"))
+            ax2.plot([p[0] for p in pts], [p[1] for p in pts], color=BLAME_COLOUR[col], marker="o", markersize=2.5,
+                     linewidth=1.5, alpha=0.8, label=legend_name(f"{name}: accuracy − base"))
     ax2.axhline(0.0, color=C_REF, linestyle="--", linewidth=1.5, label="base (lazy strategy)")
     ax1.set_title("task: test_return_mean")
     ax2.set_title("blame head: accuracy − base (above 0 = beats lazy)")
