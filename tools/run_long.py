@@ -1,68 +1,30 @@
 r"""
-Long runs -- benchmark QMIX against blame-head QMIX, managed as runs with an ID.
-================================================================================
+Long runs: benchmark QMIX against blame-head QMIX on Foraging-2s-10x10-3p-3f-v3 (CPU).
 
-A RUN has an ID you choose (e.g. s1) and ONE seed. It runs this pair, both with that seed:
-
-    job       what                                  flags
-    qmix      benchmark QMIX                        blame_head=False split_backward=False
-    blame     benchmark QMIX, blame head trained    blame_head=True  split_backward=True
-
-The two jobs of a run are started, stopped and resumed together. For several seeds, start several
-runs (e.g. s1, s2, s3) and summarise them together:  summary s1 s2 s3
-
-    Benchmark = the tuned QMIX settings for LBF (Papoudakis et al. 2021, Table 28):
-    GRU, lr 0.0003, epsilon annealed over 200k steps, soft target update 0.01,
-    evaluation epsilon 0.05. Task: Foraging-2s-10x10-3p-3f-v3, on the CPU.
-
-WHERE THINGS ARE
-    results/long_runs/runs/<id>/               everything of one run:
-        run.json                               its record: seed, steps, commit, note, attempts
-        <job>.<attempt>.log                    console output of each attempt (job = qmix or blame)
-        <job>/models/                          checkpoints every 100k steps, used by resume
-        <job>/metrics.json                     the job's logged metrics, stitched over its attempts  } written by
-        summary.txt, summary.png               the run's summary                                     } summary <id>
-    results/long_runs/summaries/<name>/        a summary of several runs: summary.txt, summary.png
-                                               (name = the IDs joined by +, or --name)
-    results/sacred/qmix/<task>/<n>/            Sacred's raw results (EPyMARL always writes them here); each
-                                               attempt is tagged label=longrun.<id>.<job>, so it can always be found
+A run has an ID and one seed, and trains two jobs with that seed:
+    qmix    benchmark QMIX                         blame_head=False split_backward=False
+    blame   benchmark QMIX + trained blame head    blame_head=True  split_backward=True
+Benchmark settings: Papoudakis et al. 2021, Table 28 (QMIX, LBF).
 
 COMMANDS
-    run <id> --seed S          start a new run (detached: it keeps going after the terminal closes)
-    list                       every run: ID, seed, steps, state of both jobs; and the summaries written so far
-    status <id> [<id> ...]     progress bars, updated in place until every job is done
-    summary <id>               the run's results: test return of both jobs, the blame head's accuracy
-                               against its lazy base, and a plot; saved in the run's folder
-    summary <id> <id> ...      several runs side by side and the MEAN over them, with notes when they differ
-                               in step count or code version, and a plot; saved in a new
-                               folder in summaries/ (--name to choose its name)
-    stop <id> [<id> ...]       stop the runs' jobs; they can be resumed
-    resume <id> [<id> ...]     continue the runs' unfinished jobs from their latest checkpoint
-                               (--from-scratch: start them again from step 0)
-    delete <id>                remove everything of the run: its folder and its Sacred results
-                               (summaries of several runs are kept: they are snapshots)
+    run <id> --seed S [--t-max N] [--note TEXT]    start a run (it keeps going after the terminal closes)
+    list                                           every run and the state of its two jobs
+    status <id> ...                                progress bars, updated in place (Ctrl+C stops the display only)
+    summary <id>                                   one run's results  -> results/long_runs/runs/<id>/
+    summary <id> <id> ...                          several runs and their MEAN -> results/long_runs/summaries/<id>+<id>+.../
+    stop <id> ...                                  stop the runs' jobs
+    resume <id> ... [--from-scratch] [--force]     continue unfinished jobs from their latest checkpoint
+    delete <id> [--yes]                            remove the run's folder and its Sacred results
 
-RESUME, HONESTLY
-    EPyMARL reloads the agent network, the mixer and Adam from the checkpoint and continues at the
-    checkpoint's step (up to 100k steps before the stop are redone). It does not save the replay
-    buffer, which refills first, nor the target mixer, which restarts from the loaded mixer.
-    A resumed job is close to, but not bit-identical with, one that never stopped; it is marked "r".
-    resume --from-scratch starts the job again at step 0: identical to a job that never stopped, so
-    it is not marked, and only the new attempt's results count.
-    Resume refuses if the training code (src/) changed since the run started (--force overrides).
+FILES in results/long_runs/runs/<id>/
+    run.json                          seed, steps, commit, attempts
+    <job>.<n>.log                     output of the job's attempt n
+    <job>/models/                     checkpoints every 100k steps, used by resume
+    summary.txt, summary.png, <job>/metrics.json      written by summary
 
-USAGE
-    python tools/run_long.py run s1 --seed 1 --note "4-way choice loss"
-    python tools/run_long.py run s2 --seed 2 --note "4-way choice loss"
-    python tools/run_long.py run quick --seed 7 --t-max 500000
-    python tools/run_long.py list
-    python tools/run_long.py status s1 s2           # Ctrl+C stops the display only
-    python tools/run_long.py summary s1             # -> results/long_runs/runs/s1/
-    python tools/run_long.py summary s1 s2          # -> results/long_runs/summaries/s1+s2/
-    python tools/run_long.py summary s1 s2 --name choice_loss
-    python tools/run_long.py stop s1 s2
-    python tools/run_long.py resume s1 s2
-    python tools/run_long.py delete s1
+A resumed job continues from its latest checkpoint with an empty replay buffer: close to,
+not identical with, a job that never stopped. resume --from-scratch starts at step 0 instead.
+resume refuses if src/ changed since the run started (--force overrides).
 """
 
 import argparse
@@ -90,7 +52,7 @@ SUMMARIES_DIR = ROOT / "results" / "long_runs" / "summaries"
 COMMON_SETTINGS = [
     "env_args.time_limit=50",
     f"env_args.key={ENV_KEY}",
-    "use_cuda=False",  # deterministic, like every other run in this project
+    "use_cuda=False",
     "log_interval=10000",
     "runner_log_interval=10000",
     "learner_log_interval=10000",
@@ -112,35 +74,30 @@ KINDS = {
     "blame": ["blame_head=True", "split_backward=True"],
 }
 
-# colours: blame QMIX in categorical slot 1, then the blame head's questions in slots 2-5
-# ("each agent", "team vote", "who", "whether"); plain QMIX neutral grey
-C_BLUE, C_ORANGE, C_AQUA, C_YELLOW, C_MAGENTA = "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"
-C_REF, C_INK, C_GRID = "#8a8984", "#52514e", "#e1e0d9"
-LINE = {"qmix": (C_REF, "--", "benchmark QMIX"), "blame": (C_BLUE, "-", "blame QMIX")}
+GREY = "#8a8984"
+LINE = {"qmix": (GREY, "--", "benchmark QMIX"), "blame": ("#2a78d6", "-", "blame QMIX")}
+# the blame head's questions: (name, accuracy key, base key, plot colour)
+BLAME_ROWS = [
+    ("each", "blame_acc", "blame_base", "#eb6834"),
+    ("vote", "blame_vote_acc", "blame_base", "#1baf7a"),
+    ("who", "blame_who_acc", "blame_who_base", "#eda100"),
+    ("whether", "blame_whether_acc", "blame_whether_base", "#e87ba4"),
+]
+LEGEND = [
+    "   averages over the second half of each job's steps",
+    "   return  = test return (1.0 = all food collected)",
+    "   each    = each agent's own 4-way choice (agent 1, 2, 3 or nobody) right;  vote = the team's majority vote right",
+    "   who     = at blame steps, the most likely agent is the blamed one;  whether = someone vs nobody right",
+    "   acc/base = the blame head's accuracy / the accuracy of always giving the most common answer",
+    "   *  still running (not final)    !  stopped or crashed",
+]
 
 
 # ----------------------------------------------------------------------------------
-# Runs, jobs and attempts on disk
+# Runs and jobs on disk
 # ----------------------------------------------------------------------------------
-def all_runs():
-    """Every run's record, oldest first."""
-    recs = [json.loads(p.read_text()) for p in RUNS_DIR.glob("*/run.json")]
-    return sorted(recs, key=lambda r: r["created_epoch"])
-
-
 def run_dir(run_id):
     return RUNS_DIR / run_id
-
-
-def load_run(run_id):
-    path = run_dir(run_id) / "run.json"
-    if not path.exists():
-        sys.exit(f"no run {run_id}  (see: run_long.py list)")
-    return json.loads(path.read_text())
-
-
-def save_run(rec):
-    (run_dir(rec["id"]) / "run.json").write_text(json.dumps(rec, indent=2))
 
 
 def label(run_id, kind):
@@ -148,22 +105,23 @@ def label(run_id, kind):
     return f"longrun.{run_id}.{kind}"
 
 
-def job_dir(run_id, kind):
-    return run_dir(run_id) / kind
-
-
 def attempt_log(run_id, kind, n):
     return run_dir(run_id) / f"{kind}.{n}.log"
 
 
-def unique(ids):
-    """The IDs in the order given, each once."""
-    return list(dict.fromkeys(ids))
+def load_run(run_id):
+    path = run_dir(run_id) / "run.json"
+    if not path.exists():
+        sys.exit(f"no run {run_id}")
+    return json.loads(path.read_text())
+
+
+def save_run(rec):
+    (run_dir(rec["id"]) / "run.json").write_text(json.dumps(rec, indent=2))
 
 
 def read_json(path, tries=5):
-    """Sacred rewrites metrics.json every few seconds while a run is going, so a read can catch
-    half a file. Retry briefly; None if it still fails."""
+    """Sacred rewrites metrics.json while a job runs, so a read can catch half a file: retry briefly."""
     for _ in range(tries):
         try:
             return json.loads(path.read_text())
@@ -173,83 +131,61 @@ def read_json(path, tries=5):
 
 
 def git_state():
-    """(commit, src, dirty): the commit, git's hash of the src/ folder at that commit, and whether
-    src/ has uncommitted changes. The src hash identifies the training code: commits that change
-    only tools/ or other files leave it unchanged."""
+    """(commit, git's hash of src/ at that commit, whether src/ has uncommitted changes)."""
     git = lambda *args: subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True).stdout.strip()
     return git("rev-parse", "--short", "HEAD"), git("rev-parse", "--short", "HEAD:src"), bool(git("status", "--short", "src"))
 
 
-# ----------------------------------------------------------------------------------
-# Processes and job state
-# ----------------------------------------------------------------------------------
 def live_jobs():
-    """{label: pid} for every EPyMARL process started by this tool that is alive right now."""
+    """{label: pid} of every job of this tool that is running right now."""
     alive = {}
     for d in pathlib.Path("/proc").iterdir():
-        if not d.name.isdigit():
-            continue
         try:
             args = (d / "cmdline").read_bytes().decode().split("\0")
             cwd = os.readlink(d / "cwd")
-        except (OSError, PermissionError):
-            continue
-        if "src/main.py" not in args or pathlib.Path(cwd) != ROOT:
+        except OSError:
             continue
         tag = next((a.split("=", 1)[1] for a in args if a.startswith("label=longrun.")), None)
-        if tag:
+        if tag and "src/main.py" in args and pathlib.Path(cwd) == ROOT:
             alive[tag] = int(d.name)
     return alive
 
 
 def job_state(rec, kind, alive):
-    """(status, t_env reached, number of attempts). status: running / done / crashed / stopped / not started."""
+    """(status, steps reached); status is running / done / stopped / crashed / not started."""
     attempts = rec["attempts"][kind]
     if not attempts:
-        return "not started", 0, 0
+        return "not started", 0
     path = attempt_log(rec["id"], kind, attempts[-1]["n"])
     text = path.read_text(errors="ignore") if path.exists() else ""
     t = max([int(s) for s in re.findall(r"t_env:\s*(\d+)", text)] + [attempts[-1]["start_t"]])
-    done = "Finished Training" in text
-    if label(rec["id"], kind) in alive and not done:
-        return "running", t, len(attempts)
-    if done:
-        return "done", max(t, rec["t_max"]), len(attempts)
-    return ("crashed" if "Traceback" in text else "stopped"), t, len(attempts)
+    if "Finished Training" in text:
+        return "done", max(t, rec["t_max"])
+    if label(rec["id"], kind) in alive:
+        return "running", t
+    return ("crashed" if "Traceback" in text else "stopped"), t
 
 
 def counted_attempts(rec, kind):
-    """The attempts whose results count: the latest one that started at step 0 and every one after it.
-    A restart from scratch (resume --from-scratch) replaces everything before it."""
+    """The attempts whose results count: the latest one that started at step 0 and every one after it."""
     attempts = rec["attempts"][kind]
     first = max((i for i, att in enumerate(attempts) if att["start_t"] == 0), default=0)
     return attempts[first:]
 
 
-def resumed(rec, kind):
-    """True if the job's counted results include an attempt that continued from a checkpoint."""
-    return any(att["start_t"] > 0 for att in counted_attempts(rec, kind))
-
-
 def latest_checkpoint(run_id, kind):
-    """(checkpoint directory, t_env) of the job's newest complete checkpoint, or None."""
-    best = None
-    for agent in (job_dir(run_id, kind) / "models").glob("*/*/agent.th"):
-        step = agent.parent
-        if step.name.isdigit() and (step / "mixer.th").exists() and (step / "opt.th").exists():
-            if best is None or int(step.name) > best[1]:
-                best = (step, int(step.name))
-    return best
+    """(checkpoint directory, step) of the job's newest complete checkpoint, or None."""
+    steps = [a.parent for a in (run_dir(run_id) / kind / "models").glob("*/*/agent.th")
+             if a.parent.name.isdigit() and (a.parent / "mixer.th").exists() and (a.parent / "opt.th").exists()]
+    best = max(steps, key=lambda s: int(s.name), default=None)
+    return (best, int(best.name)) if best else None
 
 
-# ----------------------------------------------------------------------------------
-# Launching
-# ----------------------------------------------------------------------------------
 def launch(rec, kind, resume_from=None):
-    """Start one attempt of a job, detached. resume_from: (checkpoint dir, t_env) or None for step 0."""
+    """Start one attempt of a job in the background. resume_from: (checkpoint dir, step) or None for step 0."""
     attempts = rec["attempts"][kind]
     n = len(attempts) + 1
-    jdir = job_dir(rec["id"], kind)
+    jdir = run_dir(rec["id"]) / kind
     jdir.mkdir(parents=True, exist_ok=True)
     cmd = ([sys.executable, "src/main.py", "--config=qmix", "--env-config=gymma", "with"]
            + COMMON_SETTINGS + BENCH_SETTINGS + KINDS[kind]
@@ -257,86 +193,71 @@ def launch(rec, kind, resume_from=None):
               f"local_results_path={jdir.relative_to(ROOT)}"])
     start_t = 0
     if resume_from:
-        # EPyMARL's checkpoint folders have spaces and colons in their names: copy the step to a plain path
+        # checkpoint folder names contain spaces and colons: copy the step to a plain path first
         src_dir, start_t = resume_from
         shutil.rmtree(jdir / "resume_from", ignore_errors=True)
         shutil.copytree(src_dir, jdir / "resume_from" / str(start_t))
         cmd += [f"checkpoint_path={(jdir / 'resume_from').relative_to(ROOT)}", f"load_step={start_t}"]
-    commit, src, dirty = git_state()
-    proc = subprocess.Popen(cmd, cwd=ROOT, stdout=open(attempt_log(rec["id"], kind, n), "w"),
-                            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
-    attempts.append({"n": n, "start_t": start_t, "started": time.strftime("%Y-%m-%d %H:%M:%S"),
-                     "pid": proc.pid, "commit": commit, "src": src, "dirty": dirty,
-                     "command": "python " + " ".join(cmd[1:])})
-    save_run(rec)  # record each attempt as soon as it starts, so no job can go unrecorded
-    return proc.pid, start_t
+    subprocess.Popen(cmd, cwd=ROOT, stdout=open(attempt_log(rec["id"], kind, n), "w"), stderr=subprocess.STDOUT,
+                     stdin=subprocess.DEVNULL, start_new_session=True)
+    attempts.append({"n": n, "start_t": start_t, "commit": git_state()[0], "command": "python " + " ".join(cmd[1:])})
+    save_run(rec)
+    return start_t
 
 
 # ----------------------------------------------------------------------------------
 # run / list / status / stop / resume / delete
 # ----------------------------------------------------------------------------------
 def cmd_run(a):
-    run_id = a.id
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", a.id):
         sys.exit("an ID may contain only letters, digits, - and _")
-    if run_dir(run_id).exists():
-        sys.exit(f"run {run_id} already exists  (resume it, or delete it first)")
+    if run_dir(a.id).exists():
+        sys.exit(f"run {a.id} already exists")
     commit, src, dirty = git_state()
     if dirty:
-        print("WARNING: src/ has uncommitted changes; this run will not be reproducible from a commit\n")
-    run_dir(run_id).mkdir(parents=True)
-    rec = {"id": run_id, "seed": a.seed, "t_max": a.t_max, "note": a.note, "task": ENV_KEY,
-           "created": time.strftime("%Y-%m-%d %H:%M"), "created_epoch": time.time(),
+        print("WARNING: src/ has uncommitted changes")
+    run_dir(a.id).mkdir(parents=True)
+    rec = {"id": a.id, "seed": a.seed, "t_max": a.t_max, "note": a.note, "created": time.strftime("%Y-%m-%d %H:%M"),
            "commit": commit, "src": src, "dirty": dirty, "attempts": {kind: [] for kind in KINDS}}
     save_run(rec)
     for kind in KINDS:
-        pid, _ = launch(rec, kind)
-        print(f"start run {run_id}  {kind:<6} pid {pid}")
-    print(f"\nrun {run_id}: seed {a.seed}, {a.t_max:,} steps, "
-          f"commit {commit}{' (uncommitted changes in src/)' if dirty else ''}")
-    print(f"follow it with:  run_long.py status {run_id}")
-
-
-def job_cell(status, t, t_max, was_resumed):
-    """A job's state in one short cell, e.g. 'running 37%', 'done', 'stopped 45% r'."""
-    pct = "" if status in ("done", "not started") else f" {min(100, t * 100 // t_max)}%"
-    return status + pct + (" r" if was_resumed else "")
+        launch(rec, kind)
+    print(f"started run {a.id}: seed {a.seed}, {a.t_max:,} steps")
 
 
 def cmd_list(a):
-    recs = all_runs()
+    recs = sorted((json.loads(p.read_text()) for p in RUNS_DIR.glob("*/run.json")), key=lambda r: (r["created"], r["id"]))
     if not recs:
         print("no runs yet")
-    else:
-        alive = live_jobs()
-        print(f"{len(recs)} run{'s' if len(recs) != 1 else ''}: {', '.join(r['id'] for r in recs)}\n")
-        w = max(8, max(len(r["id"]) for r in recs) + 2)
-        print(f"   {'id':<{w}}{'created':<18}{'seed':>5}{'t_max':>12}   {'qmix':<16}{'blame':<16}{'commit':<10}note")
-        for rec in recs:
-            qmix, blame = (job_cell(*job_state(rec, kind, alive)[:2], rec["t_max"], resumed(rec, kind)) for kind in KINDS)
-            print(f"   {rec['id']:<{w}}{rec['created']:<18}{rec['seed']:>5}{rec['t_max']:>12,}   "
-                  f"{qmix:<16}{blame:<16}{rec['commit'] + ('*' if rec['dirty'] else ''):<10}{rec['note']}")
-        print("\n   r = resumed from a checkpoint;  commit* = started with uncommitted changes in src/")
-    summaries = sorted(p.parent.name for p in SUMMARIES_DIR.glob("*/summary.txt"))
-    if summaries:
-        print(f"\nsummaries of several runs, in {SUMMARIES_DIR.relative_to(ROOT)}/:  {', '.join(summaries)}")
+        return
+    alive = live_jobs()
+    w = max(len(r["id"]) for r in recs) + 3
+    print(f"{'id':<{w}}{'created':<18}{'seed':<6}{'t_max':<12}{'qmix':<16}{'blame':<16}{'commit':<10}note")
+    for rec in recs:
+        cells = []
+        for kind in KINDS:
+            status, t = job_state(rec, kind, alive)
+            pct = f" {min(100, t * 100 // rec['t_max'])}%" if status in ("running", "stopped", "crashed") else ""
+            cells.append(status + pct)
+        commit = rec["commit"] + ("*" if rec["dirty"] else "")
+        print(f"{rec['id']:<{w}}{rec['created']:<18}{rec['seed']:<6}{rec['t_max']:<12,}"
+              f"{cells[0]:<16}{cells[1]:<16}{commit:<10}{rec['note']}")
+    print("\ncommit* = src/ had uncommitted changes")
 
 
 def status_lines(rec, alive):
-    lines = [f"run {rec['id']}  seed {rec['seed']}  {time.strftime('%H:%M:%S')}  (t_max {rec['t_max']:,})"
-             f"{'  ' + rec['note'] if rec['note'] else ''}"]
+    lines = [f"run {rec['id']}  seed {rec['seed']}  {time.strftime('%H:%M:%S')}"]
     all_done = True
     for kind in KINDS:
-        status, t, n = job_state(rec, kind, alive)
+        status, t = job_state(rec, kind, alive)
         pct = min(100, t * 100 // rec["t_max"])
         all_done &= status == "done"
-        lines.append(f"   {kind:<6}[{'#' * (pct // 2):<50}] {pct:3d}%  {t:>9,}  {status}{f'  (attempt {n})' if n > 1 else ''}")
+        lines.append(f"   {kind:<6}[{'#' * (pct // 2):<50}] {pct:3d}%  {t:>9,}  {status}")
     return lines, all_done
 
 
 def cmd_status(a):
-    """Progress bars, redrawn in place every 5 s until every job is done (Ctrl+C stops the display only)."""
-    ids = unique(a.ids)
+    ids = list(dict.fromkeys(a.ids))
 
     def draw():
         alive, lines, all_done = live_jobs(), [], True
@@ -346,103 +267,66 @@ def cmd_status(a):
             all_done &= done
         return lines, all_done
 
-    lines, all_done = draw()  # also stops here with a message if an ID does not exist
-    if all_done or not sys.stdout.isatty():  # nothing to watch, or not a terminal: print once
-        print("\n".join(lines))
+    lines, all_done = draw()
+    print("\n".join(lines))
+    if not sys.stdout.isatty():
         return
-    drawn = 0
-    print("\033[?25l", end="")                        # hide the cursor while redrawing
     try:
-        while True:
-            if drawn:
-                print(f"\033[{drawn}F", end="")       # back to the first line drawn last time
-            for line in lines:
-                print("\033[2K" + line)               # clear the old line, then write the new one
-            drawn = len(lines)
-            if all_done:
-                print(f"\nall jobs finished; next:  run_long.py summary {' '.join(ids)}")
-                return
+        while not all_done:
             time.sleep(5)
             lines, all_done = draw()
+            # move the cursor back up to the first line, then overwrite every line
+            print(f"\033[{len(lines)}F" + "".join(f"\033[2K{line}\n" for line in lines), end="", flush=True)
     except KeyboardInterrupt:
-        print("\n(display stopped; the jobs keep going)")
-    finally:
-        print("\033[?25h", end="", flush=True)        # show the cursor again
+        print()
 
 
 def cmd_stop(a):
-    recs = [load_run(run_id) for run_id in unique(a.ids)]
     alive = live_jobs()
-    for rec in recs:
-        stopped = 0
-        for kind in KINDS:
-            pid = alive.get(label(rec["id"], kind))
-            if pid:
-                os.killpg(pid, signal.SIGTERM)  # the job is its session's leader: stop it and anything it started
-                print(f"stopped run {rec['id']}  {kind:<6} pid {pid}")
-                stopped += 1
-        print(f"run {rec['id']}: {stopped} job(s) stopped"
-              + (f"; continue later with:  run_long.py resume {rec['id']}" if stopped else ""))
+    for rec in [load_run(run_id) for run_id in dict.fromkeys(a.ids)]:
+        pids = [alive[label(rec["id"], kind)] for kind in KINDS if label(rec["id"], kind) in alive]
+        for pid in pids:
+            os.killpg(pid, signal.SIGTERM)  # each job leads its own session: stop it and anything it started
+        print(f"run {rec['id']}: stopped {len(pids)} job(s)")
 
 
 def cmd_resume(a):
-    recs = [load_run(run_id) for run_id in unique(a.ids)]
     alive = live_jobs()
-    commit, src, dirty = git_state()
-    plans = []
-    for rec in recs:
-        todo = [(kind, *job_state(rec, kind, alive)[:2]) for kind in KINDS]
-        todo = [(kind, status, t) for kind, status, t in todo if status not in ("running", "done")]
-        if not todo:
-            print(f"run {rec['id']}: nothing to resume, both jobs are running or done")
-        elif (src, dirty) != (rec["src"], rec["dirty"]) and not a.force:
-            sys.exit(f"the training code (src/) changed since run {rec['id']} started (commit {rec['commit']}"
-                     f"{' with uncommitted changes' if rec['dirty'] else ''}; now {commit}"
-                     f"{' with uncommitted changes' if dirty else ''}).\nResuming would mix code versions "
-                     f"inside one run; add --force if that is really intended. Nothing was resumed.")
-        else:
-            plans.append((rec, todo))
-    for rec, todo in plans:  # launch only after every run passed the check
-        for kind, status, t in todo:
-            ckpt = None if a.from_scratch else latest_checkpoint(rec["id"], kind)
-            pid, start_t = launch(rec, kind, resume_from=ckpt)
-            how = f"from checkpoint at {start_t:,}" if ckpt else "from step 0"
-            print(f"resume run {rec['id']}  {kind:<6} pid {pid}  ({status} at {t:,}; continuing {how})")
-
-
-def sacred_dirs_of(run_id):
-    """Sacred result folders whose config carries this run's label (every attempt of both jobs)."""
-    found = []
-    for d in SACRED_DIR.glob("[0-9]*"):
-        cfg = read_json(d / "config.json", tries=1)
-        if cfg and str(cfg.get("label", "")).startswith(f"longrun.{run_id}."):
-            found.append(d)
-    return found
+    recs = [load_run(run_id) for run_id in dict.fromkeys(a.ids)]
+    todo = [(rec, kind) for rec in recs for kind in KINDS if job_state(rec, kind, alive)[0] not in ("running", "done")]
+    if not todo:
+        print("nothing to resume: every job is running or done")
+        return
+    _, src, dirty = git_state()
+    changed = sorted({rec["id"] for rec, _ in todo if (rec["src"], rec["dirty"]) != (src, dirty)})
+    if changed and not a.force:
+        sys.exit(f"src/ changed since run {', '.join(changed)} started; nothing resumed (--force to resume anyway)")
+    for rec, kind in todo:
+        start_t = launch(rec, kind, resume_from=None if a.from_scratch else latest_checkpoint(rec["id"], kind))
+        print(f"run {rec['id']} {kind}: resumed from step {start_t:,}")
 
 
 def cmd_delete(a):
-    rec = load_run(a.id)
+    load_run(a.id)  # stops here if there is no such run
     alive = live_jobs()
-    if any(label(rec["id"], kind) in alive for kind in KINDS):
-        sys.exit(f"run {rec['id']} still has running jobs; stop them first:  run_long.py stop {rec['id']}")
-    sacred = sacred_dirs_of(rec["id"])
-    n_att = sum(len(v) for v in rec["attempts"].values())
-    print(f"run {rec['id']}: seed {rec['seed']}, {n_att} attempt(s), {len(sacred)} Sacred result(s), "
-          f"folder {run_dir(rec['id']).relative_to(ROOT)}")
-    if not a.yes and input(f"type {rec['id']} to delete all of it: ").strip() != rec["id"]:
+    if any(label(a.id, kind) in alive for kind in KINDS):
+        sys.exit(f"run {a.id} is still running; stop it first")
+    if not a.yes and input(f"type {a.id} to delete it: ").strip() != a.id:
         sys.exit("not deleted")
-    for d in sacred:
-        shutil.rmtree(d)
-    shutil.rmtree(run_dir(rec["id"]))
-    print(f"deleted run {rec['id']}")
+    for d in SACRED_DIR.glob("[0-9]*"):
+        cfg = read_json(d / "config.json", tries=1)
+        if cfg and str(cfg.get("label", "")).startswith(f"longrun.{a.id}."):
+            shutil.rmtree(d)
+    shutil.rmtree(run_dir(a.id))
+    print(f"deleted run {a.id}")
 
 
 # ----------------------------------------------------------------------------------
 # summary
 # ----------------------------------------------------------------------------------
 def job_metrics(rec, kind):
-    """The job's metrics, stitched over its counted attempts: attempt k contributes its values from its
-    own start step up to (not including) the step the next attempt resumed from."""
+    """The job's logged metrics, stitched over its counted attempts: each attempt contributes its values
+    from its own start step up to the step the next attempt resumed from."""
     attempts = counted_attempts(rec, kind)
     merged = {}
     for i, att in enumerate(attempts):
@@ -462,239 +346,130 @@ def job_metrics(rec, kind):
 
 
 def late_mean(m, key, t_from):
-    if key not in m or not m[key]["values"]:
+    """Mean of the key's values from step t_from on (the last value if nothing was logged there yet)."""
+    if not m.get(key, {}).get("values"):
         return float("nan")
-    vals = [v for t, v in zip(m[key]["steps"], m[key]["values"]) if t >= t_from]
-    vals = vals or m[key]["values"][-1:]  # short run, nothing logged in the window: use the last value
+    vals = [v for t, v in zip(m[key]["steps"], m[key]["values"]) if t >= t_from] or m[key]["values"][-1:]
     return sum(vals) / len(vals)
 
 
-def share_of_the_way(acc, base):
-    """(acc - base) / (1 - base): how far the head gets from the lazy strategy (0) to perfect (1)."""
-    return (acc - base) / (1 - base) if base < 1 else float("nan")
-
-
-def fmt(x, spec):
-    """A number in the given format, e.g. '<7.3f', or a '-' of the same width when it is missing (nan)."""
-    if x == x:
-        return format(x, spec)
-    return format("-", ("<" if spec.startswith("<") else ">") + re.search(r"\d+", spec).group())
-
-
 def mean(xs):
-    xs = [x for x in xs if x == x]
+    xs = [x for x in xs if x == x]  # skip missing values (nan)
     return sum(xs) / len(xs) if xs else float("nan")
 
 
-BLAME_KEYS = ["blame_acc", "blame_vote_acc", "blame_base",
-              "blame_who_acc", "blame_who_base", "blame_whether_acc", "blame_whether_base"]
-
-
-# the questions the blame head is scored on: (name in a run's summary, column in a summary of several runs,
-# accuracy key, base key)
-BLAME_ROWS = [
-    ("choice, each agent", "each", "blame_acc", "blame_base"),
-    ("choice, team vote", "vote", "blame_vote_acc", "blame_base"),
-    ("who", "who", "blame_who_acc", "blame_who_base"),
-    ("whether", "whether", "blame_whether_acc", "blame_whether_base"),
-]
-BLAME_COLOUR = {"each": C_ORANGE, "vote": C_AQUA, "who": C_YELLOW, "whether": C_MAGENTA}
-LEGEND = [
-    "   return   = test return (1.0 = all food collected); the paper's QMIX on this task: average 0.67, maximum 0.90",
-    "   choice   = pick the right one of: agent 1, 2, 3 or nobody",
-    "              each agent (each) = every agent's own pick;  team vote (vote) = the agents' majority vote",
-    "   who      = only at steps where someone is to blame: is the most likely agent the blamed one",
-    "   whether  = say \"someone\" or \"nobody\" right",
-    "   base     = always give the most common answer (the lazy strategy)",
-    "   gap      = acc - base: above 0 = beats lazy",
-    "   share    = gap / (1 - base): 0% = lazy, 100% = perfect",
-]
-MARKS = (("*", "* = still running: not final"),
-         ("r", "r = resumed from a checkpoint (close to, not bit-identical with, an uninterrupted job)"),
-         ("!", "! = stopped or crashed before the end"))
-
-
-def marks_lines(marks):
-    return ["   " + ";  ".join(text for sym, text in MARKS if sym in marks)] if marks else []
-
-
 def run_result(rec, alive):
-    """Both jobs of a run: reached, mark and return of each; the blame head's metrics; the stitched metrics."""
-    res = {"rec": rec, "marks": set(), "metrics": {}}
+    """Per job: steps reached, mark, metrics and late test return; plus the blame head's late accuracies."""
+    res = {"rec": rec}
     for kind in KINDS:
-        status, t, _ = job_state(rec, kind, alive)
+        status, t = job_state(rec, kind, alive)
         m = job_metrics(rec, kind)
-        mark = (("*" if status == "running" else "") + ("r" if resumed(rec, kind) else "")
-                + ("!" if status in ("crashed", "stopped") else ""))
-        res["marks"] |= set(mark)
-        res["metrics"][kind] = m
-        res[kind] = {"t": t, "mark": mark, "return": late_mean(m, "test_return_mean", t // 2)}
-    m, t = res["metrics"]["blame"], res["blame"]["t"]
-    res["blame_metrics"] = {k: late_mean(m, k, t // 2) for k in BLAME_KEYS} if m else None
+        mark = "*" if status == "running" else "!" if status in ("stopped", "crashed") else ""
+        res[kind] = {"t": t, "mark": mark, "metrics": m, "return": late_mean(m, "test_return_mean", t // 2)}
+    res["marks"] = "".join(s for s in "*!" if s in res["qmix"]["mark"] + res["blame"]["mark"])
+    blame = res["blame"]
+    res["acc"] = {k: late_mean(blame["metrics"], k, blame["t"] // 2) for _, acc, base, _ in BLAME_ROWS for k in (acc, base)}
     return res
 
 
-def save_lines(path, lines):
-    path.write_text("\n".join(lines) + "\n")
-    return path
-
-
-def summary_one(rec):
-    r = run_result(rec, live_jobs())
-    out = [f"run {rec['id']}  seed {rec['seed']}  t_max {rec['t_max']:,}  created {rec['created']}  "
-           f"commit {rec['commit']}{'*' if rec['dirty'] else ''}{'  -- ' + rec['note'] if rec['note'] else ''}",
-           f"written {time.strftime('%Y-%m-%d %H:%M')}; averages over the second half of what each job has reached",
-           "",
-           f"   {'job':<8}{'reached':<12}return"]
-    out += [f"   {kind:<8}{r[kind]['t']:<12,}{fmt(r[kind]['return'], '<8.3f')}{r[kind]['mark']}".rstrip() for kind in KINDS]
-    out += ["", f"   {'blame head':<21}{'acc':<8}{'base':<8}{'gap':<9}share"]
-    b = r["blame_metrics"]
-    for name, _, acc_key, base_key in BLAME_ROWS if b else []:
-        acc, base = b[acc_key], b[base_key]
-        out.append(f"   {name:<21}{fmt(acc, '<8.3f')}{fmt(base, '<8.3f')}{fmt(acc - base, '<+9.3f')}"
-                   f"{fmt(share_of_the_way(acc, base), '<+5.0%')}".rstrip())
-    out += ([] if b else ["   (no results saved yet)"]) + [""] + LEGEND + marks_lines(r["marks"])
-    print("\n".join(out))
-
-    folder = run_dir(rec["id"])
-    saved = [save_lines(folder / "summary.txt", out)]
-    for kind, m in r["metrics"].items():
-        if m:
-            job_dir(rec["id"], kind).mkdir(exist_ok=True)
-            saved.append(job_dir(rec["id"], kind) / "metrics.json")
-            saved[-1].write_text(json.dumps(m))
-    if any(r["metrics"].values()):
-        saved.append(plot({(rec["id"], kind): m for kind, m in r["metrics"].items()}, folder / "summary.png",
-                          f"run {rec['id']} (seed {rec['seed']}, t_max {rec['t_max']:,})"
-                          f"{'  -- ' + rec['note'] if rec['note'] else ''}"))
-    print(f"\nsaved in {folder.relative_to(ROOT)}/:  {', '.join(str(p.relative_to(folder)) for p in saved)}")
-
-
-def summary_many(recs, name):
+def summary(recs, folder, title):
+    """Print and save one table (a row per run, plus their MEAN if there are several) and the plot."""
     alive = live_jobs()
     results = [run_result(rec, alive) for rec in recs]
-    w = max(8, max(len(rec["id"]) for rec in recs) + 4)  # room for the ID and its marks
-    out = [f"summary {name}: {len(recs)} runs ({', '.join(rec['id'] for rec in recs)})",
-           f"written {time.strftime('%Y-%m-%d %H:%M')}; per run, averages over the second half of what each job has reached",
-           "",
-           f"   {'run':<{w}}{'seed':<6}{'t_max':<12}{'qmix':<8}{'blame':<10}blame head: gap = acc - base",
-           f"   {'':<{w}}{'':<6}{'':<12}{'return':<8}{'return':<10}" + "".join(f"{col:<9}" for _, col, _, _ in BLAME_ROWS).rstrip()]
+    w = max(len(rec["id"]) for rec in recs) + 4  # room for the ID and its marks
 
-    def gaps(b):
-        if not b:
-            return "(no blame results yet)"
-        return "".join(fmt(b[acc_key] - b[base_key], "<+9.3f") for _, _, acc_key, base_key in BLAME_ROWS).rstrip()
+    def row(first, seed, t_max, qmix, blame, acc):
+        cells = "".join(f"{f'{acc[a]:.3f}/{acc[b]:.3f}':<13}" for _, a, b, _ in BLAME_ROWS)
+        return f"   {first:<{w}}{seed:<6}{t_max:<12}{qmix:<8.3f}{blame:<9.3f}{cells}".rstrip()
 
+    head1 = f"   {'run':<{w}}{'seed':<6}{'t_max':<12}{'qmix':<8}{'blame':<9}" + "".join(f"{q:<13}" for q, _, _, _ in BLAME_ROWS)
+    head2 = f"   {'':<{w}}{'':<6}{'':<12}{'return':<8}{'return':<9}" + "acc/base     " * len(BLAME_ROWS)
+    out = [title, "", head1.rstrip(), head2.rstrip()]
     for r in results:
         rec = r["rec"]
-        marks = "".join(sym for sym, _ in MARKS if sym in r["marks"])
-        out.append(f"   {(rec['id'] + ' ' + marks).rstrip():<{w}}{rec['seed']:<6}{rec['t_max']:<12,}"
-                   f"{fmt(r['qmix']['return'], '<8.3f')}{fmt(r['blame']['return'], '<10.3f')}" + gaps(r["blame_metrics"]))
-    with_blame = [r["blame_metrics"] for r in results if r["blame_metrics"]]
-    b = {k: mean([x[k] for x in with_blame]) for k in BLAME_KEYS} if with_blame else None
-    out.append(f"   {'MEAN':<{w}}{f'{len(results)} runs':<18}{fmt(mean([r['qmix']['return'] for r in results]), '<8.3f')}"
-               f"{fmt(mean([r['blame']['return'] for r in results]), '<10.3f')}" + (gaps(b) if b else ""))
-
-    notes = []
-    if len({rec["t_max"] for rec in recs}) > 1:
-        notes.append("the runs have different step counts (t_max): the MEAN mixes different amounts of training")
-    if len({(rec["src"], rec["dirty"]) for rec in recs}) > 1:
-        notes.append("the runs come from different versions of the training code (src/): the MEAN mixes code versions")
-    out += [""] + [f"   NOTE: {note}" for note in notes] + ([""] if notes else [])
-    out += LEGEND + marks_lines(set().union(*(r["marks"] for r in results)))
+        out.append(row(f"{rec['id']} {r['marks']}", rec["seed"], f"{rec['t_max']:,}",
+                       r["qmix"]["return"], r["blame"]["return"], r["acc"]))
+    if len(results) > 1:
+        out.append(row("MEAN", "", "", mean([r["qmix"]["return"] for r in results]),
+                       mean([r["blame"]["return"] for r in results]),
+                       {k: mean([r["acc"][k] for r in results]) for k in results[0]["acc"]}))
+    out += [""] + LEGEND
     print("\n".join(out))
 
-    folder = SUMMARIES_DIR / name
-    existed = folder.exists()
     folder.mkdir(parents=True, exist_ok=True)
-    saved = [save_lines(folder / "summary.txt", out)]
-    curves = {(r["rec"]["id"], kind): m for r in results for kind, m in r["metrics"].items()}
-    if any(curves.values()):
-        saved.append(plot(curves, folder / "summary.png", f"{name}: {len(recs)} runs, one line per run"))
-    print(f"\n{'updated' if existed else 'saved in'} {folder.relative_to(ROOT)}/:  {', '.join(p.name for p in saved)}")
+    (folder / "summary.txt").write_text("\n".join(out) + "\n")
+    plot({(r["rec"]["id"], kind): r[kind]["metrics"] for r in results for kind in KINDS}, folder / "summary.png", title)
+    print(f"\nsaved in {folder.relative_to(ROOT)}/")
+    return results
 
 
 def cmd_summary(a):
-    ids = unique(a.ids)
-    if len(ids) == 1:
-        if a.name:
-            sys.exit("--name is for a summary of several runs; a single run's summary goes in its own folder")
-        summary_one(load_run(ids[0]))
+    recs = [load_run(run_id) for run_id in dict.fromkeys(a.ids)]
+    if len(recs) == 1:  # one run: saved in its own folder, with its jobs' metrics
+        rec = recs[0]
+        commit = rec["commit"] + ("*" if rec["dirty"] else "")
+        results = summary(recs, run_dir(rec["id"]), f"run {rec['id']}  commit {commit}  {rec['note']}".rstrip())
+        for kind in KINDS:
+            (run_dir(rec["id"]) / kind).mkdir(exist_ok=True)
+            (run_dir(rec["id"]) / kind / "metrics.json").write_text(json.dumps(results[0][kind]["metrics"]))
         return
-    name = a.name or "+".join(ids)
-    if not re.fullmatch(r"[A-Za-z0-9_+-]+", name):
-        sys.exit("a summary name may contain only letters, digits, -, _ and +")
-    summary_many([load_run(run_id) for run_id in ids], name)
+    name = "+".join(rec["id"] for rec in recs)
+    summary(recs, SUMMARIES_DIR / name, f"summary {name}")
 
 
 def plot(curves, path, title):
-    """Left: test return of every job. Right: each blame job's accuracy minus base, for every question in
-    BLAME_ROWS. curves: {(run ID, job): metrics}."""
-    plt.rcParams.update({"axes.edgecolor": C_GRID, "axes.labelcolor": C_INK, "xtick.color": C_INK,
-                         "ytick.color": C_INK, "axes.titlecolor": C_INK})
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.6), sharex=True)  # both panels: the same steps on the x axis
-    labelled = set()
-
-    def legend_name(name):
-        if name in labelled:
-            return None
-        labelled.add(name)
-        return name
-
+    """Left: test return of every job. Right: one panel per blame-head question, with its accuracy (solid)
+    and its base (dashed), all on a 0-1 scale. curves: {(run ID, job): metrics}."""
+    fig, ax = plt.subplot_mosaic([["return", "each", "vote"], ["return", "who", "whether"]], figsize=(14, 6),
+                                 width_ratios=[2, 1, 1], sharex=True)  # same steps on every x axis
     for (_, kind), m in curves.items():
         colour, style, name = LINE[kind]
         if "test_return_mean" in m:
-            r = m["test_return_mean"]
-            ax1.plot(r["steps"], r["values"], color=colour, linestyle=style, linewidth=2, alpha=0.85,
-                     marker="o", markersize=2.5, label=legend_name(name))
+            ax["return"].plot(m["test_return_mean"]["steps"], m["test_return_mean"]["values"],
+                              color=colour, linestyle=style, linewidth=1.5, label=name)
         if kind != "blame":
             continue
-        for name, col, acc_key, base_key in BLAME_ROWS:
-            if acc_key not in m or base_key not in m:
-                continue
-            base_at = dict(zip(m[base_key]["steps"], m[base_key]["values"]))
-            pts = [(t, v - base_at[t]) for t, v in zip(m[acc_key]["steps"], m[acc_key]["values"]) if t in base_at]
-            ax2.plot([p[0] for p in pts], [p[1] for p in pts], color=BLAME_COLOUR[col], marker="o", markersize=2.5,
-                     linewidth=1.5, alpha=0.8, label=legend_name(f"{name}: accuracy − base"))
-    ax2.axhline(0.0, color=C_REF, linestyle="--", linewidth=1.5, label="base (lazy strategy)")
-    ax1.set_title("task: test_return_mean")
-    ax2.set_title("blame head: accuracy − base (above 0 = beats lazy)")
-    ax1.set_xlim(left=0)  # shared: applies to both panels
-    for ax in (ax1, ax2):
-        ax.set_xlabel("t_env (environment steps)")
-        ax.grid(color=C_GRID, linewidth=0.8)
-        ax.spines[["top", "right"]].set_visible(False)
-        if ax.get_legend_handles_labels()[0]:
-            ax.legend(fontsize=8, frameon=False)
-    fig.suptitle(f"{title}: {ENV_KEY.split(':')[1]}, benchmark settings", color=C_INK)
+        for q, acc, base, colour in BLAME_ROWS:
+            for key, c, style, lab in ((acc, colour, "-", "accuracy"), (base, GREY, "--", "base")):
+                if key in m:
+                    ax[q].plot(m[key]["steps"], m[key]["values"], color=c, linestyle=style, linewidth=1, label=lab)
+    ax["return"].set_title("test return")
+    ax["return"].set_xlim(left=0)
+    for q, _, _, _ in BLAME_ROWS:
+        ax[q].set_title(f"blame head: {q}")
+    for name, a in ax.items():
+        a.set_ylim(0, 1)  # every panel on the same 0-1 scale
+        a.grid(alpha=0.3)
+        if name in ("return", "who", "whether"):
+            a.set_xlabel("environment steps")
+        handles, labels = a.get_legend_handles_labels()
+        if handles and name in ("return", "each"):  # one legend for the task, one for all four questions
+            unique = dict(zip(labels, handles))  # one legend entry per name, however many runs
+            a.legend(unique.values(), unique.keys(), fontsize=8, frameon=False)
+    fig.suptitle(title)
     fig.tight_layout()
     fig.savefig(path, dpi=120)
     plt.close(fig)
-    return path
 
 
 def main():
-    sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="action", required=True)
-    p = sub.add_parser("run", help="start a new run: benchmark QMIX and blame QMIX, with one seed")
-    p.add_argument("id", help="a name for the run (letters, digits, - and _)")
-    p.add_argument("--seed", type=int, required=True, help="the run's seed, e.g. --seed 1")
+    p = sub.add_parser("run", help="start a run: benchmark QMIX and blame QMIX with one seed")
+    p.add_argument("id")
+    p.add_argument("--seed", type=int, required=True)
     p.add_argument("--t-max", type=int, default=2_000_000)
-    p.add_argument("--note", default="", help="a short description, shown by list and summary")
-    sub.add_parser("list", help="every run with the state of its two jobs, and the summaries written so far")
-    for name, text in (("status", "progress bars of runs, updated in place until every job is done"),
-                       ("stop", "stop the runs' jobs")):
-        sub.add_parser(name, help=text).add_argument("ids", nargs="+", metavar="id")
-    p = sub.add_parser("summary", help="one run's results (saved in its folder), or several runs side by side "
-                                       "with their MEAN (saved in a new folder in summaries/)")
+    p.add_argument("--note", default="")
+    sub.add_parser("list", help="every run and the state of its jobs")
+    for name in ("status", "stop"):
+        sub.add_parser(name).add_argument("ids", nargs="+", metavar="id")
+    p = sub.add_parser("summary", help="one run's results, or several runs and their MEAN")
     p.add_argument("ids", nargs="+", metavar="id")
-    p.add_argument("--name", help="folder name for a summary of several runs (default: the IDs joined by +)")
-    p = sub.add_parser("resume", help="continue the runs' unfinished jobs from their latest checkpoint")
+    p = sub.add_parser("resume", help="continue unfinished jobs from their latest checkpoint")
     p.add_argument("ids", nargs="+", metavar="id")
-    p.add_argument("--from-scratch", action="store_true", help="start unfinished jobs again from step 0")
-    p.add_argument("--force", action="store_true", help="resume even though src/ changed since the run started")
-    p = sub.add_parser("delete", help="remove a run: its folder and its Sacred results")
+    p.add_argument("--from-scratch", action="store_true", help="start them again from step 0")
+    p.add_argument("--force", action="store_true", help="resume even though src/ changed")
+    p = sub.add_parser("delete", help="remove a run's folder and its Sacred results")
     p.add_argument("id")
     p.add_argument("--yes", action="store_true", help="do not ask for confirmation")
     a = parser.parse_args()
