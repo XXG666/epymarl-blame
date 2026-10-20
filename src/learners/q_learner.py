@@ -263,20 +263,23 @@ class QLearner:
                 tied = votes == votes.max(-1, keepdim=True).values             # the choices with the most votes
                 vote = th.where(tied, p.sum(1), -1.0).argmax(-1)               # among those, the most believed
 
-                # whether: blame step or not;  who: at blame steps, the most likely agent (ignoring "nobody")
                 is_blame = truth != nobody
                 share = is_blame.float().mean()
 
                 log = self.logger.log_stat
                 log("blame_loss", blame_loss.item(), t_env)
-                log("blame_loss_const", -(freq[freq > 0] * freq[freq > 0].log()).sum().item(), t_env)
+                log("blame_loss_const", -(freq[freq > 0] * freq[freq > 0].log()).sum().item(), t_env) # loss of a lazy head: one that knows only how often each answer occurs, and gives those same probabilities at every step.
+                
                 log("blame_acc", (guess == truth.unsqueeze(1)).float().mean().item(), t_env)
                 log("blame_vote_acc", (vote == truth).float().mean().item(), t_env)
                 log("blame_base", freq.max().item(), t_env)
-                log("blame_step_rate", share.item(), t_env)
+                
+                log("blame_step_rate", share.item(), t_env) # how often someone is to blame
+                
                 # yes/no: "someone" when P(someone) = 1 - P(nobody) > 0.5, not from the 4-way top choice
                 log("blame_whether_acc", ((p[..., nobody] < 0.5) == is_blame.unsqueeze(1)).float().mean().item(), t_env)
                 log("blame_whether_base", th.maximum(share, 1 - share).item(), t_env)
+                
                 if is_blame.any():
                     blamed = truth[is_blame]                                   # the blamed agent, at blame steps
                     log("blame_who_acc", (p[is_blame][..., :nobody].argmax(-1) == blamed.unsqueeze(1)).float().mean().item(), t_env)
