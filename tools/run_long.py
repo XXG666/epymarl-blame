@@ -76,19 +76,21 @@ KINDS = {
 
 GREY = "#8a8984"
 LINE = {"qmix": (GREY, "--", "benchmark QMIX"), "blame": ("#2a78d6", "-", "blame QMIX")}
-# the blame head's questions: (name, accuracy key, base key, plot colour)
+# the blame head's questions: (name, accuracy key, sensitivity key, specificity key, plot colour)
 BLAME_ROWS = [
-    ("each", "blame_acc", "blame_base", "#eb6834"),
-    ("vote", "blame_vote_acc", "blame_base", "#1baf7a"),
-    ("who", "blame_who_acc", "blame_who_base", "#eda100"),
-    ("whether", "blame_whether_acc", "blame_whether_base", "#e87ba4"),
+    ("each", "blame_each_acc", "blame_each_sens", "blame_each_spec", "#eb6834"),
+    ("vote", "blame_vote_acc", "blame_vote_sens", "blame_vote_spec", "#1baf7a"),
+    ("who", "blame_who_acc", "blame_who_sens", "blame_who_spec", "#eda100"),
+    ("whether", "blame_whether_acc", "blame_whether_sens", "blame_whether_spec", "#e87ba4"),
 ]
 LEGEND = [
     "   averages over the second half of each job's steps",
     "   return  = test return (1.0 = all food collected)",
-    "   each    = each agent's own 4-way choice (agent 1, 2, 3 or nobody) right;  vote = the team's majority vote right",
-    "   who     = at blame steps, the most likely agent is the blamed one;  whether = someone vs nobody right",
-    "   acc/base = the blame head's accuracy / the accuracy of always giving the most common answer",
+    "   each    = each agent's own 4-way answer (agent 1, 2, 3 or nobody);  vote = the team's majority vote",
+    "   who     = at blame steps, the most likely agent;  whether = someone vs nobody, from each agent's answer",
+    "   acc     = how often the answer is exactly right",
+    "   sens/spec = sensitivity / specificity (each, vote, who: averaged over their answers)",
+    "             a head that knows nothing has sens + spec = 1; above 1 = it knows something, 2 = perfect",
     "   *  still running (not final)    !  stopped or crashed",
 ]
 
@@ -359,7 +361,8 @@ def mean(xs):
 
 
 def run_result(rec, alive):
-    """Per job: steps reached, mark, metrics and late test return; plus the blame head's late accuracies."""
+    """Per job: steps reached, mark, metrics and late test return; plus the blame head's late sensitivities
+    and specificities."""
     res = {"rec": rec}
     for kind in KINDS:
         status, t = job_state(rec, kind, alive)
@@ -368,7 +371,7 @@ def run_result(rec, alive):
         res[kind] = {"t": t, "mark": mark, "metrics": m, "return": late_mean(m, "test_return_mean", t // 2)}
     res["marks"] = "".join(s for s in "*!" if s in res["qmix"]["mark"] + res["blame"]["mark"])
     blame = res["blame"]
-    res["acc"] = {k: late_mean(blame["metrics"], k, blame["t"] // 2) for _, acc, base, _ in BLAME_ROWS for k in (acc, base)}
+    res["scores"] = {k: late_mean(blame["metrics"], k, blame["t"] // 2) for _, *keys, _ in BLAME_ROWS for k in keys}
     return res
 
 
@@ -378,21 +381,21 @@ def summary(recs, folder, title):
     results = [run_result(rec, alive) for rec in recs]
     w = max(len(rec["id"]) for rec in recs) + 4  # room for the ID and its marks
 
-    def row(first, seed, t_max, qmix, blame, acc):
-        cells = "".join(f"{f'{acc[a]:.3f}/{acc[b]:.3f}':<13}" for _, a, b, _ in BLAME_ROWS)
+    def row(first, seed, t_max, qmix, blame, scores):
+        cells = "".join(f"{f'{scores[a]:.3f} {scores[b]:.3f}/{scores[c]:.3f}':<20}" for _, a, b, c, _ in BLAME_ROWS)
         return f"   {first:<{w}}{seed:<6}{t_max:<12}{qmix:<8.3f}{blame:<9.3f}{cells}".rstrip()
 
-    head1 = f"   {'run':<{w}}{'seed':<6}{'t_max':<12}{'qmix':<8}{'blame':<9}" + "".join(f"{q:<13}" for q, _, _, _ in BLAME_ROWS)
-    head2 = f"   {'':<{w}}{'':<6}{'':<12}{'return':<8}{'return':<9}" + "acc/base     " * len(BLAME_ROWS)
+    head1 = f"   {'run':<{w}}{'seed':<6}{'t_max':<12}{'qmix':<8}{'blame':<9}" + "".join(f"{q:<20}" for q, *_ in BLAME_ROWS)
+    head2 = f"   {'':<{w}}{'':<6}{'':<12}{'return':<8}{'return':<9}" + f"{'acc   sens/spec':<20}" * len(BLAME_ROWS)
     out = [title, "", head1.rstrip(), head2.rstrip()]
     for r in results:
         rec = r["rec"]
         out.append(row(f"{rec['id']} {r['marks']}", rec["seed"], f"{rec['t_max']:,}",
-                       r["qmix"]["return"], r["blame"]["return"], r["acc"]))
+                       r["qmix"]["return"], r["blame"]["return"], r["scores"]))
     if len(results) > 1:
         out.append(row("MEAN", "", "", mean([r["qmix"]["return"] for r in results]),
                        mean([r["blame"]["return"] for r in results]),
-                       {k: mean([r["acc"][k] for r in results]) for k in results[0]["acc"]}))
+                       {k: mean([r["scores"][k] for r in results]) for k in results[0]["scores"]}))
     out += [""] + LEGEND
     print("\n".join(out))
 
@@ -418,8 +421,8 @@ def cmd_summary(a):
 
 
 def plot(curves, path, title):
-    """Left: test return of every job. Right: one panel per blame-head question, with its accuracy (solid)
-    and its base (dashed), all on a 0-1 scale. curves: {(run ID, job): metrics}."""
+    """Left: test return of every job. Right: one panel per blame-head question, with its accuracy (grey),
+    sensitivity (solid) and specificity (dashed), all on a 0-1 scale. curves: {(run ID, job): metrics}."""
     fig, ax = plt.subplot_mosaic([["return", "each", "vote"], ["return", "who", "whether"]], figsize=(14, 6),
                                  width_ratios=[2, 1, 1], sharex=True)  # same steps on every x axis
     for (_, kind), m in curves.items():
@@ -429,13 +432,14 @@ def plot(curves, path, title):
                               color=colour, linestyle=style, linewidth=1.5, label=name)
         if kind != "blame":
             continue
-        for q, acc, base, colour in BLAME_ROWS:
-            for key, c, style, lab in ((acc, colour, "-", "accuracy"), (base, GREY, "--", "base")):
+        for q, acc, sens, spec, colour in BLAME_ROWS:
+            for key, c, style, lab in ((acc, GREY, "-", "accuracy"), (sens, colour, "-", "sensitivity"),
+                                       (spec, colour, "--", "specificity")):
                 if key in m:
                     ax[q].plot(m[key]["steps"], m[key]["values"], color=c, linestyle=style, linewidth=1, label=lab)
     ax["return"].set_title("test return")
     ax["return"].set_xlim(left=0)
-    for q, _, _, _ in BLAME_ROWS:
+    for q, *_ in BLAME_ROWS:
         ax[q].set_title(f"blame head: {q}")
     for name, a in ax.items():
         a.set_ylim(0, 1)  # every panel on the same 0-1 scale

@@ -255,7 +255,7 @@ class QLearner:
                 truth = blame_target[real].argmax(-1)             # (real steps,): the correct choice
                 nobody = n_choices - 1                            # the last choice is "nobody"
 
-                # lazy strategy: always give the most common correct choice of this batch
+                # how often each answer occurs in this batch (for the lazy loss)
                 freq = th.bincount(truth, minlength=n_choices).float() / truth.numel()
 
                 # team vote: the choice with the most votes; ties broken by the agents' summed probabilities
@@ -269,22 +269,48 @@ class QLearner:
                 log = self.logger.log_stat
                 log("blame_loss", blame_loss.item(), t_env)
                 log("blame_loss_const", -(freq[freq > 0] * freq[freq > 0].log()).sum().item(), t_env) # loss of a lazy head: one that knows only how often each answer occurs, and gives those same probabilities at every step.
-                
-                log("blame_acc", (guess == truth.unsqueeze(1)).float().mean().item(), t_env)
-                log("blame_vote_acc", (vote == truth).float().mean().item(), t_env)
-                log("blame_base", freq.max().item(), t_env)
-                
-                log("blame_step_rate", share.item(), t_env) # how often someone is to blame
-                
-                # yes/no: "someone" when P(someone) = 1 - P(nobody) > 0.5, not from the 4-way top choice
-                log("blame_whether_acc", ((p[..., nobody] < 0.5) == is_blame.unsqueeze(1)).float().mean().item(), t_env)
-                log("blame_whether_base", th.maximum(share, 1 - share).item(), t_env)
-                
+                log("blame_step_rate", share.item(), t_env) # how often the blame happens over real steps
+
+                # per question: accuracy (how often exactly right), and sensitivity / specificity
+                # (a head that ignores the situation always has sens + spec = 1)
+                # each and vote: the 4-way answer (each agent's own, and the team vote), averaged over the n + 1 answers
+                for name, answer, correct in (("each", guess, truth.unsqueeze(1).expand_as(guess)), ("vote", vote, truth)):
+                    sens, spec = self._sens_spec(answer, correct, n_choices)
+                    log(f"blame_{name}_acc", (answer == correct).float().mean().item(), t_env)
+                    log(f"blame_{name}_sens", sens, t_env)
+                    log(f"blame_{name}_spec", spec, t_env)
+
+                # whether, from each agent's actual answer: "someone" if it names an agent, else "nobody"
+                says_someone = guess != nobody                                 # (real steps, guessing agent)
+                at_blame = is_blame.unsqueeze(1).expand_as(says_someone)
+                log("blame_whether_acc", (says_someone == at_blame).float().mean().item(), t_env)
                 if is_blame.any():
-                    blamed = truth[is_blame]                                   # the blamed agent, at blame steps
-                    log("blame_who_acc", (p[is_blame][..., :nobody].argmax(-1) == blamed.unsqueeze(1)).float().mean().item(), t_env)
-                    log("blame_who_base", (th.bincount(blamed, minlength=nobody).max() / blamed.numel()).item(), t_env)
+                    log("blame_whether_sens", says_someone[at_blame].float().mean().item(), t_env)       # blame steps flagged
+                if (~is_blame).any():
+                    log("blame_whether_spec", (~says_someone[~at_blame]).float().mean().item(), t_env)   # nobody steps left alone
+
+                # who: at blame steps, the most likely agent (ignoring "nobody"), averaged over the n agents
+                if is_blame.any():
+                    who = p[is_blame][..., :nobody].argmax(-1)                 # (blame steps, guessing agent)
+                    blamed = truth[is_blame].unsqueeze(1).expand_as(who)
+                    sens, spec = self._sens_spec(who, blamed, nobody)
+                    log("blame_who_acc", (who == blamed).float().mean().item(), t_env)
+                    log("blame_who_sens", sens, t_env)
+                    log("blame_who_spec", spec, t_env)
         return blame_loss
+
+    @staticmethod
+    def _sens_spec(answer, correct, k):
+        """Sensitivity and specificity, each averaged over the k possible answers. For answer c: sensitivity =
+        when the correct answer is c, how often c was given; specificity = when it is not c, how often c was not given."""
+        sens, spec = [], []
+        for c in range(k):
+            is_c, said_c = correct == c, answer == c
+            if is_c.any():
+                sens.append(said_c[is_c].float().mean().item())
+            if (~is_c).any():
+                spec.append((~said_c[~is_c]).float().mean().item())
+        return sum(sens) / len(sens), sum(spec) / len(spec)
 
     def _update_targets_hard(self):
         self.target_mac.load_state(self.mac)
