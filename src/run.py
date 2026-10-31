@@ -104,7 +104,7 @@ def run_sequential(args, logger):
     args.n_agents = env_info["n_agents"]
     args.n_actions = env_info["n_actions"]
     args.state_shape = env_info["state_shape"]
-    # Stage 0: width of the B block: one output per team member, plus one for "nobody to blame"
+    # width of the B block: 1 blame logit + one importance logit per team member
     args.n_blame_outputs = args.n_agents + 1 if getattr(args, "blame_head", False) else 0
 
     # Default/Base scheme

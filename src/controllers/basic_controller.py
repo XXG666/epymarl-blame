@@ -20,7 +20,7 @@ class BasicMAC:
         # Only select actions for the selected batch elements in bs
         avail_actions = ep_batch["avail_actions"][:, t_ep]
         agent_outputs = self.forward(ep_batch, t_ep, test_mode=test_mode)
-        # Stage 0: only the Q half takes part in action selection
+        # only the Q part takes part in action selection
         agent_outputs = agent_outputs[..., : self.args.n_actions]
         chosen_actions = self.action_selector.select_action(agent_outputs[bs], avail_actions[bs], t_env, test_mode=test_mode)
         return chosen_actions
@@ -30,7 +30,7 @@ class BasicMAC:
         avail_actions = ep_batch["avail_actions"][:, t]
         agent_outs, self.hidden_states = self.agent(agent_inputs, self.hidden_states)
 
-        # --- Stage 0: split [ Q | B ] so that normalisation touches Q only ---
+        # --- split [ Q | blame | importance ] so that normalisation touches Q only ---
         n_blame = getattr(self.args, "n_blame_outputs", 0)
         if n_blame > 0:
             q_outs, b_outs = agent_outs[:, :-n_blame], agent_outs[:, -n_blame:]

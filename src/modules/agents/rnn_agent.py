@@ -14,28 +14,21 @@ class RNNAgent(nn.Module):
             self.rnn = nn.GRUCell(args.hidden_dim, args.hidden_dim)
         else:
             self.rnn = nn.Linear(args.hidden_dim, args.hidden_dim)
-        # Stage 0: [ Q (n_actions) | B (n_blame_outputs) ]
-        self.n_blame_outputs = getattr(args, "n_blame_outputs", 0)
-        n_out = args.n_actions + self.n_blame_outputs
+        self.fc2 = nn.Linear(args.hidden_dim, args.n_actions)  # the Q head, exactly as in plain QMIX
 
-        if self.n_blame_outputs > 0 and getattr(args, "blame_head_rng_match", True):
-            """ 
-            P = where fc2 starts (after fc1 and rnn are built)
-            STEP 1   bookmark P
-            STEP 2   draw 650  →  now at P + 650     B rows get values
-            STEP 3   rewind    →  back at P          the 650 are "un-spent"
-            STEP 4   draw 390  →  now at P + 390     exactly the baseline's draw
-            END      at P + 390  ←  where the baseline would be
-            """
+        # Output per step: [ Q (n_actions) | blame (1) | importance (n_agents) ]
+        # The two blame sub-heads read the hidden state like the Q head; the learner trains their output at step
+        # t+1 on step t, so they judge a step with its outcome in view.
+        #   blame      : one logit, "the team did worse than predicted at step t" (the sign of dL/dQ_a)
+        #   importance : one logit per agent, "this agent has the largest mixer weight at step t"
+        self.n_blame_outputs = getattr(args, "n_blame_outputs", 0)
+        if self.n_blame_outputs > 0:
+            # built after fc2 from a bookmarked RNG state, then rewound, so that everything built later (the mixer)
+            # and every exploration draw are identical to plain QMIX
             rng_state = th.get_rng_state()
-            self.fc2 = nn.Linear(args.hidden_dim, n_out)
+            self.blame = nn.Linear(args.hidden_dim, 1)
+            self.importance = nn.Linear(args.hidden_dim, args.n_agents)
             th.set_rng_state(rng_state)
-            ref = nn.Linear(args.hidden_dim, args.n_actions)
-            with th.no_grad():
-                self.fc2.weight[: args.n_actions] = ref.weight
-                self.fc2.bias[: args.n_actions] = ref.bias
-        else:
-            self.fc2 = nn.Linear(args.hidden_dim, n_out)
 
     def init_hidden(self):
         # make hidden states on same device as model
@@ -48,13 +41,8 @@ class RNNAgent(nn.Module):
             h = self.rnn(x, h_in)
         else:
             h = F.relu(self.rnn(x))
+        q = self.fc2(h)
         if self.n_blame_outputs > 0:
-            # fix float32 rounding 
-            n = self.args.n_actions
-            q = F.linear(h, self.fc2.weight[:n], self.fc2.bias[:n])
-            b = F.linear(h, self.fc2.weight[n:], self.fc2.bias[n:])
-            q = th.cat([q, b], dim=-1)
-        else:
-            q = self.fc2(h)
+            q = th.cat([q, self.blame(h), self.importance(h)], dim=-1)
         return q, h
 

@@ -20,7 +20,7 @@ FILES in results/long_runs/runs/<id>/
     run.json                          seed, steps, commit, attempts
     <job>.<n>.log                     output of the job's attempt n
     <job>/models/                     checkpoints every 100k steps, used by resume
-    summary.txt, summary.png, <job>/metrics.json      written by summary
+    summary.txt, summary.png, sens_spec.png, <job>/metrics.json      written by summary
 
 A resumed job continues from its latest checkpoint with an empty replay buffer: close to,
 not identical with, a job that never stopped. resume --from-scratch starts at step 0 instead.
@@ -42,6 +42,7 @@ import matplotlib
 
 matplotlib.use("Agg")  # draw into a file; WSL usually has no screen
 import matplotlib.pyplot as plt
+import numpy as np
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 ENV_KEY = "lbforaging:Foraging-2s-10x10-3p-3f-v3"
@@ -76,21 +77,17 @@ KINDS = {
 
 GREY = "#8a8984"
 LINE = {"qmix": (GREY, "--", "benchmark QMIX"), "blame": ("#2a78d6", "-", "blame QMIX")}
-# the blame head's questions: (name, accuracy key, sensitivity key, specificity key, plot colour)
-BLAME_ROWS = [
-    ("each", "blame_each_acc", "blame_each_sens", "blame_each_spec", "#eb6834"),
-    ("vote", "blame_vote_acc", "blame_vote_sens", "blame_vote_spec", "#1baf7a"),
-    ("who", "blame_who_acc", "blame_who_sens", "blame_who_spec", "#eda100"),
-    ("whether", "blame_whether_acc", "blame_whether_sens", "blame_whether_spec", "#e87ba4"),
-]
+# the blame head's questions, read from the logged confusion counts cm_<question>_<each|vote>_<truth>_<answer>
+QUESTIONS = [("blame", "#e87ba4"), ("importance", "#eda100"), ("combined", "#1baf7a")]
+WHO = ["each", "vote"]
 LEGEND = [
-    "   averages over the second half of each job's steps",
-    "   return  = test return (1.0 = all food collected)",
-    "   each    = each agent's own 4-way answer (agent 1, 2, 3 or nobody);  vote = the team's majority vote",
-    "   who     = at blame steps, the most likely agent;  whether = someone vs nobody, from each agent's answer",
-    "   acc     = how often the answer is exactly right",
-    "   sens/spec = sensitivity / specificity (each, vote, who: averaged over their answers)",
-    "             a head that knows nothing has sens + spec = 1; above 1 = it knows something, 2 = perfect",
+    "   pooled over the second half of each job's steps",
+    "   return     = test return (1.0 = all food collected)",
+    "   blame      = did the team do worse than predicted (1) or not (0);  importance = which agent has the largest mixer weight",
+    "   combined   = the final answer: the most important agent if blame, else nobody",
+    "   each       = every agent's own answer;  vote = the team's majority vote",
+    "   acc/maj    = accuracy / the majority baseline (always give the most common answer)",
+    "   sens/spec  = sensitivity / specificity (blame: answer 1 is positive; importance, combined: macro-averaged over the answers)",
     "   *  still running (not final)    !  stopped or crashed",
 ]
 
@@ -360,48 +357,85 @@ def mean(xs):
     return sum(xs) / len(xs) if xs else float("nan")
 
 
+def counts(m, q, who):
+    """[(step, k x k confusion matrix)] of a question at every log point; rows = truth, columns = answer."""
+    keys = [k for k in m if k.startswith(f"cm_{q}_{who}_")]
+    if not keys:
+        return []
+    k = max(int(key.split("_")[-1]) for key in keys) + 1
+    series = {(i, j): m[f"cm_{q}_{who}_{i}_{j}"]["values"] for i in range(k) for j in range(k)}
+    steps = m[keys[0]]["steps"]
+    return [(t, [[series[i, j][n] for j in range(k)] for i in range(k)]) for n, t in enumerate(steps)]
+
+
+def measures(c, binary):
+    """(accuracy, majority baseline, sensitivity, specificity) of one confusion matrix.
+    binary: plain sens/spec with answer 1 as the positive; otherwise macro-averaged over the answers."""
+    k = len(c)
+    total = sum(map(sum, c))
+    if total == 0:
+        return (float("nan"),) * 4
+    rows = [sum(r) for r in c]
+    cols = [sum(c[i][j] for i in range(k)) for j in range(k)]
+    answers = [1] if binary else range(k)
+    sens = mean(c[i][i] / rows[i] for i in answers if rows[i])
+    spec = mean((total - rows[i] - cols[i] + c[i][i]) / (total - rows[i]) for i in answers if total - rows[i])
+    return sum(c[i][i] for i in range(k)) / total, max(rows) / total, sens, spec
+
+
 def run_result(rec, alive):
-    """Per job: steps reached, mark, metrics and late test return; plus the blame head's late sensitivities
-    and specificities."""
-    res = {"rec": rec}
+    """Per job: steps reached, mark, metrics and late test return. Per question and who: the measures pooled over
+    the second half of the blame job's steps, and the accuracy / majority curves at every log point."""
+    res = {"rec": rec, "scores": {}, "curves": {}}
     for kind in KINDS:
         status, t = job_state(rec, kind, alive)
         m = job_metrics(rec, kind)
         mark = "*" if status == "running" else "!" if status in ("stopped", "crashed") else ""
         res[kind] = {"t": t, "mark": mark, "metrics": m, "return": late_mean(m, "test_return_mean", t // 2)}
     res["marks"] = "".join(s for s in "*!" if s in res["qmix"]["mark"] + res["blame"]["mark"])
-    blame = res["blame"]
-    res["scores"] = {k: late_mean(blame["metrics"], k, blame["t"] // 2) for _, *keys, _ in BLAME_ROWS for k in keys}
+    m, t_half = res["blame"]["metrics"], res["blame"]["t"] // 2
+    for q, _ in QUESTIONS:
+        for who in WHO:
+            cms = counts(m, q, who)
+            late = [c for t, c in cms if t >= t_half] or [c for _, c in cms[-1:]]
+            pooled = [[sum(c[i][j] for c in late) for j in range(len(late[0]))] for i in range(len(late[0]))] if late else [[0]]
+            res["scores"][q, who] = measures(pooled, q == "blame")
+            per_step = [(t, *measures(c, q == "blame")[:2]) for t, c in cms]
+            res["curves"][q, who] = ([t for t, _, _ in per_step], [a for _, a, _ in per_step], [b for _, _, b in per_step])
     return res
 
 
 def summary(recs, folder, title):
-    """Print and save one table (a row per run, plus their MEAN if there are several) and the plot."""
+    """Print and save one table (two lines per run: each agent's answers, the team vote; plus their MEAN if there
+    are several runs), the plot and the sensitivity/specificity map."""
     alive = live_jobs()
     results = [run_result(rec, alive) for rec in recs]
     w = max(len(rec["id"]) for rec in recs) + 4  # room for the ID and its marks
+    cell = lambda acc, maj, sens, spec: f"{acc:.3f}/{maj:.3f} {sens:.3f}/{spec:.3f}"
 
-    def row(first, seed, t_max, qmix, blame, scores):
-        cells = "".join(f"{f'{scores[a]:.3f} {scores[b]:.3f}/{scores[c]:.3f}':<20}" for _, a, b, c, _ in BLAME_ROWS)
-        return f"   {first:<{w}}{seed:<6}{t_max:<12}{qmix:<8.3f}{blame:<9.3f}{cells}".rstrip()
+    def rows(first, seed, t_max, qmix, blame, scores):
+        lines = []
+        for i, who in enumerate(WHO):
+            left = f"{first:<{w}}{seed:<6}{t_max:<12}{qmix:<8.3f}{blame:<9.3f}" if i == 0 else " " * (w + 35)
+            lines.append(f"   {left}{who:<6}" + "".join(f"{cell(*scores[q, who]):<24}" for q, _ in QUESTIONS).rstrip())
+        return lines
 
-    head1 = f"   {'run':<{w}}{'seed':<6}{'t_max':<12}{'qmix':<8}{'blame':<9}" + "".join(f"{q:<20}" for q, *_ in BLAME_ROWS)
-    head2 = f"   {'':<{w}}{'':<6}{'':<12}{'return':<8}{'return':<9}" + f"{'acc   sens/spec':<20}" * len(BLAME_ROWS)
+    head1 = f"   {'run':<{w}}{'seed':<6}{'t_max':<12}{'qmix':<8}{'blame':<9}{'':<6}" + "".join(f"{q:<24}" for q, _ in QUESTIONS)
+    head2 = f"   {'':<{w}}{'':<6}{'':<12}{'return':<8}{'return':<9}{'':<6}" + "acc/maj     sens/spec   " * len(QUESTIONS)
     out = [title, "", head1.rstrip(), head2.rstrip()]
     for r in results:
         rec = r["rec"]
-        out.append(row(f"{rec['id']} {r['marks']}", rec["seed"], f"{rec['t_max']:,}",
-                       r["qmix"]["return"], r["blame"]["return"], r["scores"]))
+        out += rows(f"{rec['id']} {r['marks']}", rec["seed"], f"{rec['t_max']:,}", r["qmix"]["return"], r["blame"]["return"], r["scores"])
     if len(results) > 1:
-        out.append(row("MEAN", "", "", mean([r["qmix"]["return"] for r in results]),
-                       mean([r["blame"]["return"] for r in results]),
-                       {k: mean([r["scores"][k] for r in results]) for k in results[0]["scores"]}))
+        out += rows("MEAN", "", "", mean(r["qmix"]["return"] for r in results), mean(r["blame"]["return"] for r in results),
+                    {key: tuple(mean(r["scores"][key][i] for r in results) for i in range(4)) for key in results[0]["scores"]})
     out += [""] + LEGEND
     print("\n".join(out))
 
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "summary.txt").write_text("\n".join(out) + "\n")
-    plot({(r["rec"]["id"], kind): r[kind]["metrics"] for r in results for kind in KINDS}, folder / "summary.png", title)
+    plot(results, folder / "summary.png", title)
+    sens_spec_map(results, folder / "sens_spec.png", title)
     print(f"\nsaved in {folder.relative_to(ROOT)}/")
     return results
 
@@ -420,39 +454,86 @@ def cmd_summary(a):
     summary(recs, SUMMARIES_DIR / name, f"summary {name}")
 
 
-def plot(curves, path, title):
-    """Left: test return of every job. Right: one panel per blame-head question, with its accuracy (grey),
-    sensitivity (solid) and specificity (dashed), all on a 0-1 scale. curves: {(run ID, job): metrics}."""
-    fig, ax = plt.subplot_mosaic([["return", "each", "vote"], ["return", "who", "whether"]], figsize=(14, 6),
-                                 width_ratios=[2, 1, 1], sharex=True)  # same steps on every x axis
-    for (_, kind), m in curves.items():
+def band(ax, series, colour, style="-", label=None, width=1.5):
+    """Draw the mean of several (steps, values) series as a line and their min-max range as a shaded band.
+    The series are put on a common grid first (linear interpolation; a run contributes only where it has data)."""
+    series = [(s, v) for s, v in series if s]
+    if not series:
+        return
+    grid = np.linspace(0, max(s[-1] for s, _ in series), 200)
+    rows = np.array([np.interp(grid, s, v, left=np.nan, right=np.nan) for s, v in series])
+    ok = ~np.isnan(rows).all(0)   # grid points where at least one run has data
+    grid, rows = grid[ok], rows[:, ok]
+    ax.plot(grid, np.nanmean(rows, 0), color=colour, linestyle=style, linewidth=width, label=label)
+    if len(series) > 1:
+        ax.fill_between(grid, np.nanmin(rows, 0), np.nanmax(rows, 0), color=colour, alpha=0.15, linewidth=0)
+
+
+def plot(results, path, title):
+    """Left: test return of both jobs. Right: a panel per question (columns) and who (rows), with accuracy (colour)
+    and the majority baseline (grey dashed). Lines are the mean over the runs, bands their min-max range."""
+    fig, ax = plt.subplot_mosaic([["return"] + [f"{q}_each" for q, _ in QUESTIONS], ["return"] + [f"{q}_vote" for q, _ in QUESTIONS]],
+                                 figsize=(17, 6.5), width_ratios=[2, 1, 1, 1], sharex=True)
+    for kind in KINDS:
         colour, style, name = LINE[kind]
-        if "test_return_mean" in m:
-            ax["return"].plot(m["test_return_mean"]["steps"], m["test_return_mean"]["values"],
-                              color=colour, linestyle=style, linewidth=1.5, label=name)
-        if kind != "blame":
-            continue
-        for q, acc, sens, spec, colour in BLAME_ROWS:
-            for key, c, style, lab in ((acc, GREY, "-", "accuracy"), (sens, colour, "-", "sensitivity"),
-                                       (spec, colour, "--", "specificity")):
-                if key in m:
-                    ax[q].plot(m[key]["steps"], m[key]["values"], color=c, linestyle=style, linewidth=1, label=lab)
+        band(ax["return"], [(r[kind]["metrics"].get("test_return_mean", {}).get("steps", []),
+                             r[kind]["metrics"].get("test_return_mean", {}).get("values", [])) for r in results], colour, style, name)
+    for q, colour in QUESTIONS:
+        for who in WHO:
+            a = ax[f"{q}_{who}"]
+            band(a, [(r["curves"][q, who][0], r["curves"][q, who][1]) for r in results], colour, label="accuracy")
+            band(a, [(r["curves"][q, who][0], r["curves"][q, who][2]) for r in results], GREY, "--", "majority baseline", 1)
+            a.set_title(f"{q}: {who}")
     ax["return"].set_title("test return")
     ax["return"].set_xlim(left=0)
-    for q, *_ in BLAME_ROWS:
-        ax[q].set_title(f"blame head: {q}")
     for name, a in ax.items():
-        a.set_ylim(0, 1)  # every panel on the same 0-1 scale
+        a.set_ylim(0, 1)
         a.grid(alpha=0.3)
-        if name in ("return", "who", "whether"):
+        a.xaxis.set_major_formatter(lambda x, _: f"{x / 1e6:g}M")   # steps in millions
+        if name == "return" or name.endswith("_vote"):
             a.set_xlabel("environment steps")
-        handles, labels = a.get_legend_handles_labels()
-        if handles and name in ("return", "each"):  # one legend for the task, one for all four questions
-            unique = dict(zip(labels, handles))  # one legend entry per name, however many runs
-            a.legend(unique.values(), unique.keys(), fontsize=8, frameon=False)
-    fig.suptitle(title)
+        if name in ("return", "blame_each"):
+            a.legend(fontsize=8, frameon=False)
+    fig.suptitle(f"{title}  ({len(results)} run{'s' if len(results) != 1 else ''}: line = mean, band = min to max)")
     fig.tight_layout()
     fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+
+def sens_spec_map(results, path, title):
+    """Each question's sensitivity against 1 - specificity, pooled over the second half and averaged over the runs:
+    hollow = each agent's answers, filled = the team vote. On the diagonal a head knows nothing (sens + spec = 1);
+    the top-left corner is perfect."""
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.plot([0, 1], [0, 1], color=GREY, linestyle="--", linewidth=1)
+    ax.text(0.78, 0.70, "knows nothing\nsens + spec = 1", color=GREY, fontsize=9, rotation=45, ha="center", va="center")
+    for q, colour in QUESTIONS:
+        pts = {}
+        for who in WHO:
+            x = mean(1 - r["scores"][q, who][3] for r in results)
+            y = mean(r["scores"][q, who][2] for r in results)
+            if x == x:
+                pts[who] = (x, y)
+                ax.scatter(x, y, s=90, facecolor=colour if who == "vote" else "none", edgecolor=colour, linewidth=2, zorder=3)
+        if len(pts) == 2:
+            ax.annotate("", xy=pts["vote"], xytext=pts["each"], arrowprops=dict(arrowstyle="->", color=colour, lw=1.3))
+        if pts:
+            x, y = pts.get("vote", pts.get("each"))
+            offset = (-10 if x > 0.8 else 10, -14 if y > 0.9 else 4)   # keep the label inside the map near a corner
+            ax.annotate(q, (x, y), xytext=offset, textcoords="offset points", fontsize=10, weight="bold",
+                        ha="right" if x > 0.8 else "left")
+    ax.scatter([], [], s=90, facecolor="none", edgecolor="#2b2b29", linewidth=2, label="each agent")
+    ax.scatter([], [], s=90, facecolor="#2b2b29", edgecolor="#2b2b29", linewidth=2, label="team vote")
+    ax.legend(loc="lower right", fontsize=9, frameon=False)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.set_xlabel("1 − specificity   (false alarms: says it when it is not)")
+    ax.set_ylabel("sensitivity   (hits: says it when it is)")
+    ax.set_title(f"{title}\nsensitivity vs specificity: above the diagonal = knows something; up-left = knows more", fontsize=10)
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
     plt.close(fig)
 
 
