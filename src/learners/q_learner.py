@@ -187,8 +187,8 @@ class QLearner:
                     3, actions, dL_dQa.unsqueeze(3) # "=" assign the value
 )
                 # --- blame and importance, read from the interrupted signal ---
-                # the sub-heads judge step t at step t+1 (mac_out[:, 1:]), with the step's outcome in view
-                # the sub-heads judge step t at step t+1 (mac_out[:, 1:]), with the step's outcome in view
+                # the sub-heads judge step t at step t+1 (mac_out[:, 1:]); there the agent's heads read
+                # [ h_t | h_{t+1} ], the situation when it acted and the situation with the step's outcome in view
                 b = mac_out[:, 1:, :, self.args.n_actions :]              # [ blame logit | importance logits ]
                 g = dL_dQa.detach()
                 real, blame_target = self._blame_target(g, mask)

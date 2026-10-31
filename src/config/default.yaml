@@ -59,4 +59,4 @@ hypergroup: null
 split_backward: False # Cut the autograd graph at the per-agent utilities
 
 # --- Blame head options ---
-blame_head: False # give each agent a blame head and an importance head alongside its Q head
+blame_head: False # give each agent a blame head and an importance head (reading [h_t, h_{t+1}]) alongside its Q head
