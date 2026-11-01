@@ -191,6 +191,17 @@ def run_sequential(args, logger):
     last_test_T = -args.test_interval - 1
     last_log_T = 0
     model_save_time = 0
+    n_test_runs = max(1, args.test_nepisode // runner.batch_size)
+    # the test episodes are also the held-out set for the blame heads: they are collected here, graded by the
+    # learner without any update, and never enter the replay buffer
+    held_out = ReplayBuffer(
+        scheme,
+        groups,
+        n_test_runs,
+        env_info["episode_limit"] + 1,
+        preprocess=preprocess,
+        device="cpu" if args.buffer_cpu_only else args.device,
+    )
 
     start_time = time.time()
     last_time = start_time
@@ -215,7 +226,6 @@ def run_sequential(args, logger):
             learner.train(episode_sample, runner.t_env, episode)
 
         # Execute test runs once in a while
-        n_test_runs = max(1, args.test_nepisode // runner.batch_size)
         if (runner.t_env - last_test_T) / args.test_interval >= 1.0:
             logger.console_logger.info(
                 "t_env: {} / {}".format(runner.t_env, args.t_max)
@@ -230,7 +240,12 @@ def run_sequential(args, logger):
 
             last_test_T = runner.t_env
             for _ in range(n_test_runs):
-                runner.run(test_mode=True)
+                held_out.insert_episode_batch(runner.run(test_mode=True))
+            test_batch = held_out[:n_test_runs]
+            test_batch = test_batch[:, : test_batch.max_t_filled()]
+            if test_batch.device != args.device:
+                test_batch.to(args.device)
+            learner.held_out(test_batch, runner.t_env)
 
         if args.save_model and (
             runner.t_env - model_save_time >= args.save_model_interval

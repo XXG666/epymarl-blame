@@ -196,11 +196,9 @@ class QLearner:
                 blame_loss = self._blame_loss(b[..., 0], blame_target, real)
                 imp_loss = self._importance_loss(b[..., 1:], imp_target, defined)
                 if t_env - self.log_stats_t >= self.args.learner_log_interval:
-                    with th.no_grad():
-                        p_blame, p_imp = th.sigmoid(b[..., 0]), th.softmax(b[..., 1:], dim=-1)
-                        self._log_blame(p_blame, blame_target, real, blame_loss, t_env)
-                        self._log_importance(p_imp, imp_target, defined, imp_loss, t_env)
-                        self._log_combined(p_blame, p_imp, blame_target, imp_target, real, t_env)
+                    self.logger.log_stat("blame_loss", blame_loss.item(), t_env)
+                    self.logger.log_stat("importance_loss", imp_loss.item(), t_env)
+                    self._log_answers(b, blame_target, imp_target, real, defined, t_env)
                 # resume: autograd adds the TD gradient (full_grad) and the two losses' gradient, one pass
                 th.autograd.backward([mac_out, blame_loss + imp_loss], [full_grad, None])
             else:
@@ -268,17 +266,77 @@ class QLearner:
         return F.cross_entropy(logits[steps].reshape(-1, n_agents),
                                target.unsqueeze(2).expand(-1, -1, logits.size(2))[steps].reshape(-1))
 
-    def _log_blame(self, p_blame, target, steps, loss, t_env):
+    def held_out(self, batch: EpisodeBatch, t_env: int):
+        """Grade the sub-heads on the runner's test episodes, which never enter the replay buffer.
+        The labels are the same as in train (dL/dQ_a from the current networks) but nothing is learned: no
+        optimiser step, no target update, no change to the reward statistics.  The counts are logged as
+        cm_held_out_<question>_..., next to the training counts cm_<question>_..."""
+        if getattr(self.args, "n_blame_outputs", 0) == 0:
+            return
+        assert not self.args.standardise_returns, "held_out does not standardise returns"
+        rewards = batch["reward"][:, :-1]
+        actions = batch["actions"][:, :-1]
+        terminated = batch["terminated"][:, :-1].float()
+        mask = batch["filled"][:, :-1].float()
+        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
+        avail_actions = batch["avail_actions"]
+        if self.args.standardise_rewards:
+            rewards = (rewards - self.rew_ms.mean) / th.sqrt(self.rew_ms.var)  # current statistics, not updated
+        rewards = rewards.expand(-1, -1, self.n_agents)
+
+        with th.no_grad():  # the same forward passes and targets as train, just without a graph
+            mac_out = self._rollout(self.mac, batch)
+            q_out, b = mac_out[..., : self.args.n_actions], mac_out[:, 1:, :, self.args.n_actions :]
+            q_agents = th.gather(q_out[:, :-1], dim=3, index=actions).squeeze(3)
+            target_mac_out = self._rollout(self.target_mac, batch)[:, 1:, :, : self.args.n_actions]
+            target_mac_out[avail_actions[:, 1:] == 0] = -9999999
+            if self.args.double_q:
+                live = q_out.clone()
+                live[avail_actions == 0] = -9999999
+                target_max_qvals = th.gather(target_mac_out, 3, live[:, 1:].max(dim=3, keepdim=True)[1]).squeeze(3)
+            else:
+                target_max_qvals = target_mac_out.max(dim=3)[0]
+            targets = rewards + self.args.gamma * (1 - terminated) * self.target_mixer(target_max_qvals, batch["state"][:, 1:])
+
+        # the same cut as in train: only the mixer is in the graph, and only dL/dQ_a is read from it
+        q_agents_cut = q_agents.detach().requires_grad_(True)
+        td_error = self.mixer(q_agents_cut, batch["state"][:, :-1]) - targets
+        mask = mask.expand_as(td_error)
+        loss = ((td_error * mask) ** 2).sum() / mask.sum()
+        dL_dQa = th.autograd.grad(loss, q_agents_cut)[0]
+
+        real, blame_target = self._blame_target(dL_dQa, mask)
+        defined, imp_target = self._importance_target(dL_dQa, mask)
+        self._log_answers(b, blame_target, imp_target, real, defined, t_env, where="held_out_")
+
+    @staticmethod
+    def _rollout(mac, batch):
+        """Every agent's output at every step of the batch: (batch, time, agent, outputs)."""
+        mac.init_hidden(batch.batch_size)
+        return th.stack([mac.forward(batch, t=t) for t in range(batch.max_seq_length)], dim=1)
+
+    # ------------------------------------------------------------------------------------------------
+    # Logging: confusion counts of the three questions.  where = "" for training batches, "held_out_" for
+    # the test episodes; the metric names become cm_<where><question>_<each|vote>_<truth>_<answer>.
+    # ------------------------------------------------------------------------------------------------
+    def _log_answers(self, b, blame_target, imp_target, real, defined, t_env, where=""):
+        """b (batch, time, agent, [ blame logit | importance logits ]) and the targets from _blame_target and
+        _importance_target.  Turns the logits into probabilities and counts each question's answers."""
+        with th.no_grad():
+            p_blame, p_imp = th.sigmoid(b[..., 0]), th.softmax(b[..., 1:], dim=-1)
+            self._log_blame(p_blame, blame_target, real, t_env, where)
+            self._log_importance(p_imp, imp_target, defined, t_env, where)
+            self._log_combined(p_blame, p_imp, blame_target, imp_target, real, t_env, where)
+
+    def _log_blame(self, p_blame, target, steps, t_env, where=""):
         """p_blame (batch, time, agent) = P(someone is to blame). Answer: 1 if P > 0.5."""
-        self.logger.log_stat("blame_loss", loss.item(), t_env)
-        self._log_counts("blame", target.long(), (p_blame > 0.5).long(), th.stack([1 - p_blame, p_blame], -1), steps, t_env)
+        self._log_counts(where + "blame", target.long(), (p_blame > 0.5).long(), th.stack([1 - p_blame, p_blame], -1), steps, t_env)
 
-    def _log_importance(self, p_imp, target, steps, loss, t_env):
+    def _log_importance(self, p_imp, target, steps, t_env, where=""):
         """p_imp (batch, time, agent, n_agents) = P(each agent is the most important). Answer: the most likely."""
-        self.logger.log_stat("importance_loss", loss.item(), t_env)
-        self._log_counts("importance", target, p_imp.argmax(-1), p_imp, steps, t_env)
+        self._log_counts(where + "importance", target, p_imp.argmax(-1), p_imp, steps, t_env)
 
-    def _log_combined(self, p_blame, p_imp, blame_target, imp_target, steps, t_env):
+    def _log_combined(self, p_blame, p_imp, blame_target, imp_target, steps, t_env, where=""):
         """The final answer: the most important agent if blame, else "nobody" (index n_agents).
         Its probabilities multiply: P(agent k) = P(blame) * P(k | importance), P(nobody) = 1 - P(blame).
         The truth is the same rule applied to the targets, i.e. the old n + 1 blame target."""
@@ -286,7 +344,7 @@ class QLearner:
         answer = th.where(p_blame > 0.5, p_imp.argmax(-1), nobody)
         probs = th.cat([p_blame.unsqueeze(-1) * p_imp, (1 - p_blame).unsqueeze(-1)], dim=-1)
         truth = th.where(blame_target == 1, imp_target, nobody)
-        self._log_counts("combined", truth, answer, probs, steps, t_env)
+        self._log_counts(where + "combined", truth, answer, probs, steps, t_env)
 
     def _log_counts(self, name, truth, answer, probs, steps, t_env):
         """Confusion counts of each agent's answer and of the team vote: cm_<name>_<each|vote>_<truth>_<answer>.
