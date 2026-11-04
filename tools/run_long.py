@@ -7,7 +7,9 @@ A run has an ID and one seed, and trains two jobs with that seed:
 Benchmark settings: Papoudakis et al. 2021, Table 28 (QMIX, LBF).
 
 COMMANDS
-    run <id> --seed S [--t-max N] [--note TEXT]    start a run (it keeps going after the terminal closes)
+    run <id> --seed S [--t-max N] [--note TEXT] [--blame KEY=VALUE ...]
+                                                   start a run (it keeps going after the terminal closes);
+                                                   --blame adds settings to the blame job only
     list                                           every run and the state of its two jobs
     status <id> ...                                progress bars, updated in place (Ctrl+C stops the display only)
     summary <id>                                   one run's results  -> results/long_runs/runs/<id>/
@@ -41,6 +43,8 @@ def main():
     p.add_argument("--seed", type=int, required=True)
     p.add_argument("--t-max", type=int, default=2_000_000)
     p.add_argument("--note", default="")
+    p.add_argument("--blame", nargs="*", default=[], metavar="KEY=VALUE",
+                   help="extra settings for the blame job only, e.g. fresh_head_batch=True blame_margin=2")
     sub.add_parser("list", help="every run and the state of its jobs")
     for name in ("status", "stop"):
         sub.add_parser(name).add_argument("ids", nargs="+", metavar="id")

@@ -29,7 +29,8 @@ SETS = [("", ""), ("held_out_", "held-out ")]  # (metric prefix, label): the tra
 LEGEND = [
     "   pooled over the second half of each job's steps",
     "   return     = test return (1.0 = all food collected)",
-    "   blame      = did the team do worse than predicted (1) or not (0);  importance = which agent has the largest mixer weight",
+    "   blame      = did the team do worse than predicted (1) or not (0), by the run's blame_margin if it has one;",
+    "                importance = which agent has the largest mixer weight",
     "   combined   = the final answer: the most important agent if blame, else nobody",
     "   each       = every agent's own answer;  vote = the team's majority vote",
     "   held-out   = the same, on the test episodes (epsilon 0.05), which the agents never train on",

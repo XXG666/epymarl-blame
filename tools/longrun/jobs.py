@@ -103,7 +103,7 @@ def launch(rec, kind, resume_from=None):
     jdir = run_dir(rec["id"]) / kind
     jdir.mkdir(parents=True, exist_ok=True)
     cmd = ([sys.executable, "src/main.py", "--config=qmix", "--env-config=gymma", "with"]
-           + COMMON_SETTINGS + BENCH_SETTINGS + KINDS[kind]
+           + COMMON_SETTINGS + BENCH_SETTINGS + KINDS[kind] + rec.get("settings", {}).get(kind, [])
            + [f"t_max={rec['t_max']}", f"seed={rec['seed']}", f"label={label(rec['id'], kind)}",
               f"local_results_path={jdir.relative_to(ROOT)}"])
     start_t = 0

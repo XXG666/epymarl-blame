@@ -49,7 +49,9 @@ class QLearner:
             rew_shape = (1,) if self.args.common_reward else (self.n_agents,)
             self.rew_ms = RunningMeanStd(shape=rew_shape, device=device)
 
-    def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
+    def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, fresh: EpisodeBatch = None):
+        """One update on the sampled batch.  fresh (fresh_head_batch=True): the newest episodes of the buffer;
+        the blame heads then learn from these instead of the sampled batch, while Q learning is unchanged."""
         # Get the relevant quantities
         rewards = batch["reward"][:, :-1]
         actions = batch["actions"][:, :-1]
@@ -119,7 +121,7 @@ class QLearner:
         Mixer, keep a pointer on the per-agent Q-value BEFORE the mixer as 
         the mixer call below rebinds `chosen_action_qvals` to Q_tot
         """
-        q_agents = chosen_action_qvals  # (batch, time, n_agents)
+        q_agents = chosen_action_qvals  # (batch, steps, n_agents)
         q_agents_cut = None
         if self.mixer is not None:
             if getattr(self.args, "split_backward", False):
@@ -177,8 +179,8 @@ class QLearner:
                 full_grad = th.zeros_like(mac_out) # q + b
 
                 """
-                Batch, Time, Agents, Actions
-                full_grad[b][t][a][ actions[b][t][a][0] ]  =  dL_dQa[b][t][a][0]
+                Episode, Step (0..49 within the episode), Agent, Action
+                full_grad[e][t][a][ actions[e][t][a][0] ]  =  dL_dQa[e][t][a][0]
                           ▲  ▲  ▲    ▲
                           │  │  │    └── comes from the INDEX
                           └──┴──┴─────── come straight from the position
@@ -186,13 +188,21 @@ class QLearner:
                 full_grad[:, :-1, :, : self.args.n_actions].scatter_(
                     3, actions, dL_dQa.unsqueeze(3) # "=" assign the value
 )
-                # --- blame and importance, read from the interrupted signal ---
-                # the sub-heads judge step t at step t+1 (mac_out[:, 1:]); there the agent's heads read
-                # [ h_t | h_{t+1} ], the situation when it acted and the situation with the step's outcome in view
-                b = mac_out[:, 1:, :, self.args.n_actions :]              # [ blame logit | importance logits ]
-                g = dL_dQa.detach()
-                real, blame_target = self._blame_target(g, mask)
-                defined, imp_target = self._importance_target(g, mask)
+                # --- blame and importance ---
+                # the sub-heads judge step t at step t+1 (slot 1 onwards); there the agent's heads read
+                # [ h_t | h_{t+1} ], the situation when it acted and the situation with the step's outcome in view.
+                # Their labels come from the TD error and dL/dQ_a of the batch they read: the sampled batch,
+                # whose signal the interrupted backward pass just produced, or the newest episodes (fresh),
+                # whose signal _credit computes with the current networks without learning anything from it.
+                if fresh is None:
+                    b = mac_out[:, 1:, :, self.args.n_actions :]          # [ blame logit | importance logits ]
+                    delta, g, head_mask = td_error[..., 0].detach(), dL_dQa.detach(), mask
+                else:
+                    fresh_out = self._rollout(self.mac, fresh)            # with a graph: the heads learn from it
+                    b = fresh_out[:, 1:, :, self.args.n_actions :]
+                    delta, g, head_mask = self._credit(fresh, fresh_out)
+                real, blame_target = self._blame_target(delta, head_mask)
+                defined, imp_target = self._importance_target(g, head_mask)
                 blame_loss = self._blame_loss(b[..., 0], blame_target, real)
                 imp_loss = self._importance_loss(b[..., 1:], imp_target, defined)
                 if t_env - self.log_stats_t >= self.args.learner_log_interval:
@@ -241,14 +251,23 @@ class QLearner:
             self.log_stats_t = t_env
 
     # ------------------------------------------------------------------------------------------------
-    # Two sub-heads trained on the interrupted gradient dL/dQ_a = (2/|T|) * delta * dQ_tot/dQ_a.
-    # Every agent judges the same step from its own view, so all agents share each target (batch, time).
+    # Two sub-heads trained on the TD error delta = Q_tot - target and on the interrupted gradient
+    # dL/dQ_a = (2/|T|) * delta * dQ_tot/dQ_a.  Every agent judges the same step from its own view, so all
+    # agents share each target (batch, steps).
     # ------------------------------------------------------------------------------------------------
-    def _blame_target(self, dL_dQa, mask):
-        """blame: did the team do worse than predicted at this step (dL/dQ_a > 0)?  1 or 0.
-        Returns (steps that count = real steps, target)."""
+    def _blame_target(self, delta, mask):
+        """blame: did the team do worse than predicted at this step?  1 or 0, from delta (batch, steps).
+        blame_margin = 0: any delta > 0.  k > 0: delta above the batch's median by k robust standard deviations
+        (1.4826 * MAD) of the batch's deltas, i.e. a clear miss by the batch's own scale; this strips the small
+        positive delta of the typical step on which nothing happens.  Returns (steps that count = real steps, target)."""
         real = mask[..., 0] > 0
-        return real, (dL_dQa.max(-1).values > 0).float()
+        tau = 0.0
+        k = getattr(self.args, "blame_margin", 0)
+        if k > 0:
+            d = delta[real]
+            med = d.median()
+            tau = med + k * 1.4826 * (d - med).abs().median()
+        return real, (delta > tau).float()
 
     def _importance_target(self, dL_dQa, mask):
         """importance: which agent has the largest mixer weight dQ_tot/dQ_a?  Since delta is shared by the agents,
@@ -266,14 +285,13 @@ class QLearner:
         return F.cross_entropy(logits[steps].reshape(-1, n_agents),
                                target.unsqueeze(2).expand(-1, -1, logits.size(2))[steps].reshape(-1))
 
-    def held_out(self, batch: EpisodeBatch, t_env: int):
-        """Grade the sub-heads on the runner's test episodes, which never enter the replay buffer.
-        The labels are the same as in train (dL/dQ_a from the current networks) but nothing is learned: no
-        optimiser step, no target update, no change to the reward statistics.  The counts are logged as
-        cm_held_out_<question>_..., next to the training counts cm_<question>_..."""
-        if getattr(self.args, "n_blame_outputs", 0) == 0:
-            return
-        assert not self.args.standardise_returns, "held_out does not standardise returns"
+    def _credit(self, batch, mac_out):
+        """The TD error delta = Q_tot - target (batch, steps) and dL/dQ_a (batch, steps, agents) of a batch with
+        the current networks, for labels only: the same arithmetic as train, but no parameter gradient is kept
+        and nothing is learned (no optimiser step, no target update, no change to the reward statistics).
+        mac_out: the agents' output on the batch from _rollout; only its Q part is read, without its graph.
+        Also returns the mask (batch, steps, agents) of the real steps."""
+        assert not self.args.standardise_returns, "_credit does not standardise returns"
         rewards = batch["reward"][:, :-1]
         actions = batch["actions"][:, :-1]
         terminated = batch["terminated"][:, :-1].float()
@@ -285,8 +303,7 @@ class QLearner:
         rewards = rewards.expand(-1, -1, self.n_agents)
 
         with th.no_grad():  # the same forward passes and targets as train, just without a graph
-            mac_out = self._rollout(self.mac, batch)
-            q_out, b = mac_out[..., : self.args.n_actions], mac_out[:, 1:, :, self.args.n_actions :]
+            q_out = mac_out[..., : self.args.n_actions]
             q_agents = th.gather(q_out[:, :-1], dim=3, index=actions).squeeze(3)
             target_mac_out = self._rollout(self.target_mac, batch)[:, 1:, :, : self.args.n_actions]
             target_mac_out[avail_actions[:, 1:] == 0] = -9999999
@@ -304,8 +321,19 @@ class QLearner:
         mask = mask.expand_as(td_error)
         loss = ((td_error * mask) ** 2).sum() / mask.sum()
         dL_dQa = th.autograd.grad(loss, q_agents_cut)[0]
+        return td_error[..., 0].detach(), dL_dQa, mask
 
-        real, blame_target = self._blame_target(dL_dQa, mask)
+    def held_out(self, batch: EpisodeBatch, t_env: int):
+        """Grade the sub-heads on the runner's test episodes, which never enter the replay buffer.
+        The labels are the same as in train (from the current networks) but nothing is learned.  The counts are
+        logged as cm_held_out_<question>_..., next to the training counts cm_<question>_..."""
+        if getattr(self.args, "n_blame_outputs", 0) == 0:
+            return
+        with th.no_grad():
+            mac_out = self._rollout(self.mac, batch)
+        delta, dL_dQa, mask = self._credit(batch, mac_out)
+        b = mac_out[:, 1:, :, self.args.n_actions :]
+        real, blame_target = self._blame_target(delta, mask)
         defined, imp_target = self._importance_target(dL_dQa, mask)
         self._log_answers(b, blame_target, imp_target, real, defined, t_env, where="held_out_")
 

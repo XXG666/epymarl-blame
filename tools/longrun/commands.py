@@ -17,12 +17,15 @@ def cmd_run(a):
         sys.exit("an ID may contain only letters, digits, - and _")
     if run_dir(a.id).exists():
         sys.exit(f"run {a.id} already exists")
+    if any("=" not in s for s in a.blame):
+        sys.exit("--blame takes settings of the form key=value")
     commit, src, dirty = git_state()
     if dirty:
         print("WARNING: src/ has uncommitted changes")
     run_dir(a.id).mkdir(parents=True)
     rec = {"id": a.id, "seed": a.seed, "t_max": a.t_max, "note": a.note, "created": time.strftime("%Y-%m-%d %H:%M"),
-           "commit": commit, "src": src, "dirty": dirty, "attempts": {kind: [] for kind in KINDS}}
+           "commit": commit, "src": src, "dirty": dirty, "settings": {"blame": a.blame},
+           "attempts": {kind: [] for kind in KINDS}}
     save_run(rec)
     for kind in KINDS:
         launch(rec, kind)
@@ -44,9 +47,10 @@ def cmd_list(a):
             pct = f" {min(100, t * 100 // rec['t_max'])}%" if status in ("running", "stopped", "crashed") else ""
             cells.append(status + pct)
         commit = rec["commit"] + ("*" if rec["dirty"] else "")
+        settings = " ".join(rec.get("settings", {}).get("blame", []))
         print(f"{rec['id']:<{w}}{rec['created']:<18}{rec['seed']:<6}{rec['t_max']:<12,}"
-              f"{cells[0]:<16}{cells[1]:<16}{commit:<10}{rec['note']}")
-    print("\ncommit* = src/ had uncommitted changes")
+              f"{cells[0]:<16}{cells[1]:<16}{commit:<10}{rec['note']}" + (f"  [{settings}]" if settings else ""))
+    print("\ncommit* = src/ had uncommitted changes;  [...] = extra settings of the blame job")
 
 
 def status_lines(rec, alive):

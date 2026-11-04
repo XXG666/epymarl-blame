@@ -223,7 +223,15 @@ def run_sequential(args, logger):
             if episode_sample.device != args.device:
                 episode_sample.to(args.device)
 
-            learner.train(episode_sample, runner.t_env, episode)
+            if getattr(args, "fresh_head_batch", False):
+                # the blame heads learn from the newest episodes instead of the sampled ones (Q learning unchanged)
+                fresh = buffer.newest(args.batch_size)
+                fresh = fresh[:, : fresh.max_t_filled()]
+                if fresh.device != args.device:
+                    fresh.to(args.device)
+                learner.train(episode_sample, runner.t_env, episode, fresh=fresh)
+            else:
+                learner.train(episode_sample, runner.t_env, episode)
 
         # Execute test runs once in a while
         if (runner.t_env - last_test_T) / args.test_interval >= 1.0:

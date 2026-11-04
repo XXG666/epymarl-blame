@@ -60,3 +60,5 @@ split_backward: False # Cut the autograd graph at the per-agent utilities
 
 # --- Blame head options ---
 blame_head: False # give each agent a blame head and an importance head (reading [h_t, h_{t+1}]) alongside its Q head
+fresh_head_batch: False # train the heads on the newest batch_size episodes instead of the sampled batch (Q learning unchanged)
+blame_margin: 0 # 0: blame = any step worse than predicted (delta > 0); k > 0: delta above the batch's median by k robust std (1.4826 MAD)
