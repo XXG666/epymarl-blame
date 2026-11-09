@@ -44,7 +44,7 @@ def main():
     p.add_argument("--t-max", type=int, default=2_000_000)
     p.add_argument("--note", default="")
     p.add_argument("--blame", nargs="*", default=[], metavar="KEY=VALUE",
-                   help="extra settings for the blame job only, e.g. fresh_head_batch=True blame_margin=2")
+                   help="extra settings for the blame job only, e.g. blame_threshold=1.0 head_batch=oldest ensemble_loss=True")
     sub.add_parser("list", help="every run and the state of its jobs")
     for name in ("status", "stop"):
         sub.add_parser(name).add_argument("ids", nargs="+", metavar="id")

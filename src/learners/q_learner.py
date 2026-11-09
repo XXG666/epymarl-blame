@@ -49,9 +49,9 @@ class QLearner:
             rew_shape = (1,) if self.args.common_reward else (self.n_agents,)
             self.rew_ms = RunningMeanStd(shape=rew_shape, device=device)
 
-    def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, fresh: EpisodeBatch = None):
-        """One update on the sampled batch.  fresh (fresh_head_batch=True): the newest episodes of the buffer;
-        the blame heads then learn from these instead of the sampled batch, while Q learning is unchanged."""
+    def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, head_batch: EpisodeBatch = None):
+        """One update on the sampled batch.  head_batch (head_batch = newest / oldest in the config): the episodes
+        the blame heads learn from instead of the sampled batch; Q learning is unchanged."""
         # Get the relevant quantities
         rewards = batch["reward"][:, :-1]
         actions = batch["actions"][:, :-1]
@@ -192,15 +192,15 @@ class QLearner:
                 # the sub-heads judge step t at step t+1 (slot 1 onwards); there the agent's heads read
                 # [ h_t | h_{t+1} ], the situation when it acted and the situation with the step's outcome in view.
                 # Their labels come from the TD error and dL/dQ_a of the batch they read: the sampled batch,
-                # whose signal the interrupted backward pass just produced, or the newest episodes (fresh),
+                # whose signal the interrupted backward pass just produced, or a batch of their own (head_batch),
                 # whose signal _credit computes with the current networks without learning anything from it.
-                if fresh is None:
+                if head_batch is None:
                     b = mac_out[:, 1:, :, self.args.n_actions :]          # [ blame logit | importance logits ]
                     delta, g, head_mask = td_error[..., 0].detach(), dL_dQa.detach(), mask
                 else:
-                    fresh_out = self._rollout(self.mac, fresh)            # with a graph: the heads learn from it
-                    b = fresh_out[:, 1:, :, self.args.n_actions :]
-                    delta, g, head_mask = self._credit(fresh, fresh_out)
+                    head_out = self._rollout(self.mac, head_batch)        # with a graph: the heads learn from it
+                    b = head_out[:, 1:, :, self.args.n_actions :]
+                    delta, g, head_mask = self._credit(head_batch, head_out)   # delta and dL/dQ_a of those episodes
                 real, blame_target = self._blame_target(delta, head_mask)
                 defined, imp_target = self._importance_target(g, head_mask)
                 blame_loss = self._blame_loss(b[..., 0], blame_target, real)
@@ -256,14 +256,15 @@ class QLearner:
     # agents share each target (batch, steps).
     # ------------------------------------------------------------------------------------------------
     def _blame_target(self, delta, mask):
-        """blame: did the team do worse than predicted at this step?  1 or 0, from delta (batch, steps).
-        blame_margin = 0: any delta > 0.  k > 0: delta above the batch's median by k robust standard deviations
-        (1.4826 * MAD) of the batch's deltas, i.e. a clear miss by the batch's own scale; this strips the small
-        positive delta of the typical step on which nothing happens.  Returns (steps that count = real steps, target)."""
+        """blame: did the team do worse than predicted at this step?  1 or 0, from delta (batch, steps), as delta > tau.
+        blame_threshold > 0 fixes tau (standardised reward units).  Else blame_margin k > 0 sets it to the batch's
+        median plus k robust standard deviations (1.4826 * MAD) of the batch's deltas, a clear miss by the batch's
+        own scale.  Else tau = 0: any step worse than predicted.  Returns (steps that count = real steps, target)."""
         real = mask[..., 0] > 0
-        tau = 0.0
+        tau = getattr(self.args, "blame_threshold", 0)
         k = getattr(self.args, "blame_margin", 0)
-        if k > 0:
+        assert not (tau > 0 and k > 0), "set blame_threshold or blame_margin, not both"
+        if tau <= 0 and k > 0:
             d = delta[real]
             med = d.median()
             tau = med + k * 1.4826 * (d - med).abs().median()
@@ -276,12 +277,18 @@ class QLearner:
         return defined, dL_dQa.abs().argmax(-1)
 
     def _blame_loss(self, logit, target, steps):
-        """BCE between the blame logit (batch, time, agent) and the shared 0/1 target, over the counted steps."""
+        """BCE between the blame logits (batch, time, agent) and the shared 0/1 target over the counted steps:
+        one term per agent, or with ensemble_loss one term per step on the team's mean logit."""
+        if getattr(self.args, "ensemble_loss", False):
+            return F.binary_cross_entropy_with_logits(logit.mean(2)[steps], target[steps])
         return F.binary_cross_entropy_with_logits(logit[steps], target.unsqueeze(2).expand_as(logit)[steps])
 
     def _importance_loss(self, logits, target, steps):
-        """Cross-entropy between the importance logits (batch, time, agent, n_agents) and the shared target index."""
+        """Cross-entropy between the importance logits (batch, time, agent, n_agents) and the shared target index:
+        one term per agent, or with ensemble_loss one term per step on the team's mean logits."""
         n_agents = logits.size(-1)
+        if getattr(self.args, "ensemble_loss", False):
+            return F.cross_entropy(logits.mean(2)[steps], target[steps])
         return F.cross_entropy(logits[steps].reshape(-1, n_agents),
                                target.unsqueeze(2).expand(-1, -1, logits.size(2))[steps].reshape(-1))
 
@@ -335,6 +342,9 @@ class QLearner:
         b = mac_out[:, 1:, :, self.args.n_actions :]
         real, blame_target = self._blame_target(delta, mask)
         defined, imp_target = self._importance_target(dL_dQa, mask)
+        with th.no_grad():
+            self.logger.log_stat("held_out_blame_loss", self._blame_loss(b[..., 0], blame_target, real).item(), t_env)
+            self.logger.log_stat("held_out_importance_loss", self._importance_loss(b[..., 1:], imp_target, defined).item(), t_env)
         self._log_answers(b, blame_target, imp_target, real, defined, t_env, where="held_out_")
 
     @staticmethod
@@ -346,25 +356,38 @@ class QLearner:
     # ------------------------------------------------------------------------------------------------
     # Logging: confusion counts of the three questions.  where = "" for training batches, "held_out_" for
     # the test episodes; the metric names become cm_<where><question>_<each|vote>_<truth>_<answer>.
+    # The team's answer ("vote") is the majority vote, or with ensemble_loss the prediction from the team's
+    # mean logits, which is what that loss trains.  For blame, the histogram of the probability per truth is
+    # logged too (ph_...), so that the summary can grade a rare label without the 0.5 rule.
     # ------------------------------------------------------------------------------------------------
+    P_BINS = [0.0, 0.01, 0.02, 0.03, 0.05, 0.07, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
     def _log_answers(self, b, blame_target, imp_target, real, defined, t_env, where=""):
         """b (batch, time, agent, [ blame logit | importance logits ]) and the targets from _blame_target and
         _importance_target.  Turns the logits into probabilities and counts each question's answers."""
         with th.no_grad():
             p_blame, p_imp = th.sigmoid(b[..., 0]), th.softmax(b[..., 1:], dim=-1)
-            self._log_blame(p_blame, blame_target, real, t_env, where)
-            self._log_importance(p_imp, imp_target, defined, t_env, where)
-            self._log_combined(p_blame, p_imp, blame_target, imp_target, real, t_env, where)
+            team = None
+            if getattr(self.args, "ensemble_loss", False):               # the team's probabilities from its mean logits
+                team = th.sigmoid(b[..., 0].mean(2)), th.softmax(b[..., 1:].mean(2), dim=-1)
+            self._log_blame(p_blame, blame_target, real, t_env, where, team)
+            self._log_importance(p_imp, imp_target, defined, t_env, where, team)
+            self._log_combined(p_blame, p_imp, blame_target, imp_target, real, t_env, where, team)
 
-    def _log_blame(self, p_blame, target, steps, t_env, where=""):
-        """p_blame (batch, time, agent) = P(someone is to blame). Answer: 1 if P > 0.5."""
-        self._log_counts(where + "blame", target.long(), (p_blame > 0.5).long(), th.stack([1 - p_blame, p_blame], -1), steps, t_env)
+    def _log_blame(self, p_blame, target, steps, t_env, where="", team=None):
+        """p_blame (batch, time, agent) = P(someone is to blame). Answer: 1 if P > 0.5.  The team's probability for
+        the histogram is the ensemble's, or else the mean of the agents'."""
+        p_team = team[0] if team is not None else p_blame.mean(2)
+        vote = (p_team > 0.5).long() if team is not None else None
+        self._log_counts(where + "blame", target.long(), (p_blame > 0.5).long(), th.stack([1 - p_blame, p_blame], -1), steps, t_env, vote)
+        self._log_hist(where + "blame", target.long(), p_blame, p_team, steps, t_env)
 
-    def _log_importance(self, p_imp, target, steps, t_env, where=""):
+    def _log_importance(self, p_imp, target, steps, t_env, where="", team=None):
         """p_imp (batch, time, agent, n_agents) = P(each agent is the most important). Answer: the most likely."""
-        self._log_counts(where + "importance", target, p_imp.argmax(-1), p_imp, steps, t_env)
+        vote = team[1].argmax(-1) if team is not None else None
+        self._log_counts(where + "importance", target, p_imp.argmax(-1), p_imp, steps, t_env, vote)
 
-    def _log_combined(self, p_blame, p_imp, blame_target, imp_target, steps, t_env, where=""):
+    def _log_combined(self, p_blame, p_imp, blame_target, imp_target, steps, t_env, where="", team=None):
         """The final answer: the most important agent if blame, else "nobody" (index n_agents).
         Its probabilities multiply: P(agent k) = P(blame) * P(k | importance), P(nobody) = 1 - P(blame).
         The truth is the same rule applied to the targets, i.e. the old n + 1 blame target."""
@@ -372,13 +395,29 @@ class QLearner:
         answer = th.where(p_blame > 0.5, p_imp.argmax(-1), nobody)
         probs = th.cat([p_blame.unsqueeze(-1) * p_imp, (1 - p_blame).unsqueeze(-1)], dim=-1)
         truth = th.where(blame_target == 1, imp_target, nobody)
-        self._log_counts(where + "combined", truth, answer, probs, steps, t_env)
+        vote = th.where(team[0] > 0.5, team[1].argmax(-1), nobody) if team is not None else None
+        self._log_counts(where + "combined", truth, answer, probs, steps, t_env, vote)
 
-    def _log_counts(self, name, truth, answer, probs, steps, t_env):
+    def _log_hist(self, name, truth, p_each, p_team, steps, t_env):
+        """Histogram of the blame probability per truth: ph_<name>_<each|vote>_<truth>_<bin>, bin edges P_BINS (finer
+        near 0, where a rare label lives).  The summary turns it into an AUC and into the sensitivity and specificity
+        at a threshold matched to the label's rate, which the 0.5 rule cannot show for a rare label."""
+        nb = len(self.P_BINS) - 1
+        edges = th.tensor(self.P_BINS[1:-1], device=p_each.device)
+        t_each = truth.unsqueeze(2).expand_as(p_each)[steps]
+        for who, p, tru in (("each", p_each[steps], t_each), ("vote", p_team[steps], truth[steps])):
+            counts = th.bincount(tru.reshape(-1) * nb + th.bucketize(p.reshape(-1), edges), minlength=2 * nb)
+            for i in range(2):
+                for j in range(nb):
+                    self.logger.log_stat(f"ph_{name}_{who}_{i}_{j}", counts[i * nb + j].item(), t_env)
+
+    def _log_counts(self, name, truth, answer, probs, steps, t_env, vote=None):
         """Confusion counts of each agent's answer and of the team vote: cm_<name>_<each|vote>_<truth>_<answer>.
-        truth (batch, time); answer (batch, time, agent); probs (batch, time, agent, k); steps (batch, time)."""
+        truth (batch, time); answer (batch, time, agent); probs (batch, time, agent, k); steps (batch, time);
+        vote (batch, time): the team's answer, by default the majority vote with ties broken by summed probabilities."""
         k = probs.size(-1)
-        vote = self._vote(answer, probs, k)
+        if vote is None:
+            vote = self._vote(answer, probs, k)
         t_each = truth.unsqueeze(2).expand_as(answer)[steps]              # one truth per (step, agent)
         for who, ans, tru in (("each", answer[steps], t_each), ("vote", vote[steps], truth[steps])):
             counts = th.bincount(tru.reshape(-1) * k + ans.reshape(-1), minlength=k * k)   # row = truth, col = answer
