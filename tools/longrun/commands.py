@@ -77,8 +77,8 @@ def cmd_status(a):
 
     lines, all_done = draw()
     print("\n".join(lines))
-    if not sys.stdout.isatty():
-        return
+    if not sys.stdout.isatty() or len(lines) >= shutil.get_terminal_size().lines:
+        return  # no live redraw: not a terminal, or the block is taller than it (the cursor could not get back up)
     try:
         while not all_done:
             time.sleep(5)

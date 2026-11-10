@@ -223,17 +223,7 @@ def run_sequential(args, logger):
             if episode_sample.device != args.device:
                 episode_sample.to(args.device)
 
-            mode = getattr(args, "head_batch", "sampled")
-            if mode == "sampled":
-                learner.train(episode_sample, runner.t_env, episode)
-            else:
-                # the blame heads learn from a batch of their own; Q learning keeps the sampled one
-                assert mode in ("newest", "oldest"), f"head_batch must be sampled, newest or oldest, not {mode}"
-                head_batch = buffer.newest(args.batch_size) if mode == "newest" else buffer.oldest(args.batch_size)
-                head_batch = head_batch[:, : head_batch.max_t_filled()]  # trims the time axis to make it run faster
-                if head_batch.device != args.device:
-                    head_batch.to(args.device)
-                learner.train(episode_sample, runner.t_env, episode, head_batch=head_batch)
+            learner.train(episode_sample, runner.t_env, episode)
 
         # Execute test runs once in a while
         if (runner.t_env - last_test_T) / args.test_interval >= 1.0:

@@ -59,8 +59,9 @@ hypergroup: null
 split_backward: False # Cut the autograd graph at the per-agent utilities
 
 # --- Blame head options ---
-blame_head: False # give each agent a blame head and an importance head (reading [h_t, h_{t+1}]) alongside its Q head
-head_batch: "sampled" # episodes the heads learn from: sampled (the Q-learning batch), newest (the last batch_size played), oldest (batch_size drawn from the oldest quarter of the buffer); Q learning always uses the sampled batch
+blame_head: False # give each agent a blame head and an importance head alongside its Q head, reading the same hidden state
+blame_window: 1 # n > 1: the blame label describes the n steps ending at the step: the sum of delta over them, to which blame_threshold then applies
+importance_window: 1 # n > 1: the importance label comes from dL/dQ_a summed over the n steps ending at the step (kept at 1 by default: the sum follows the window's most surprising step, good or bad)
 blame_threshold: 0 # fixed threshold: tau > 0 labels a step blame when delta = Q_tot - target > tau (standardised reward units)
 blame_margin: 0 # relative threshold: k > 0 labels a step blame when delta exceeds the batch's median by k robust std (1.4826 MAD); both 0: any delta > 0
 ensemble_loss: False # one loss per step on the team's mean logits instead of one per agent; the team's prediction is then logged as the vote

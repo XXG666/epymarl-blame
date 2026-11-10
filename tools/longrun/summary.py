@@ -23,24 +23,23 @@ QUESTIONS = [("blame", "#e87ba4"), ("importance", "#eda100"), ("combined", "#1ba
 WHO = ["each", "vote"]
 
 
-SETS = [("", ""), ("held_out_", "held-out ")]  # (metric prefix, label): the training batches, the test episodes
-
-
 P_BINS = [0.0, 0.01, 0.02, 0.03, 0.05, 0.07, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]  # as the learner logs them
 
 
 LEGEND = [
     "   pooled over the second half of each job's steps",
     "   return     = test return (1.0 = all food collected)",
-    "   blame      = did the team do worse than predicted (1) or not (0): delta > 0, or above the run's blame_threshold / blame_margin;",
-    "                importance = which agent has the largest mixer weight",
+    "   blame      = did the team do worse than predicted (1) or not (0): delta > 0, or above the run's blame_threshold / blame_margin,",
+    "                summed over blame_window steps if the run has one;  importance = which agent has the largest mixer weight",
     "   combined   = the final answer: the most important agent if blame, else nobody",
     "   each       = every agent's own answer;  vote = the team's majority vote, or with ensemble_loss the team's mean-logit prediction",
-    "   held-out   = the same, on the test episodes (epsilon 0.05), which the agents never train on",
+    "                both graded on the held-out test episodes (epsilon 0.05), which the agents never train on;",
+    "                (train) = a run from before held-out grading, graded on its training batches",
     "   acc/maj    = accuracy / the majority baseline (always give the most common answer)",
     "   sens/spec  = sensitivity / specificity (blame: answer 1 is positive; importance, combined: macro-averaged over the answers)",
     "   blame ranked = auc: chance that a blame step gets a higher blame probability than a not-blame step (0.5 = nothing learned);",
     "                sens/spec@rate: sensitivity / specificity when the head flags as many steps as there are blame steps",
+    "   train - held-out = how much better the training batches look: importance accuracy, blame auc (near 0 unless the heads overfit)",
     "   *  still running (not final)    !  stopped or crashed",
 ]
 
@@ -110,65 +109,80 @@ def ranked(P, N):
 
 
 def run_result(rec, alive):
-    """Per job: steps reached, mark, metrics, late test return. Per (question, who, where): the measures pooled over
-    the second half of the blame job's steps ("scores"), and (steps, accuracy, majority) at every log point ("curves").
-    Per (who, where): the ranked blame measures pooled the same way ("ranked") and (steps, auc) ("auc_curve")."""
-    res = {"rec": rec, "scores": {}, "curves": {}, "ranked": {}, "auc_curve": {}}
+    """Per job: steps reached, mark, metrics, late test return.  The blame job's heads are graded on the held-out
+    test episodes when the run has them ("set" = "held-out"), else on its training batches ("training").
+    Per (question, who): the measures pooled over the second half of the job's steps ("scores") and (steps, accuracy,
+    majority) at every log point ("curves").  Per who: the ranked blame measures ("ranked") and how much better the
+    training batches look than the held-out episodes ("gap": importance accuracy, blame auc)."""
+    res = {"rec": rec, "scores": {}, "curves": {}, "ranked": {}, "gap": {}}
     for kind in KINDS:
         status, t = job_state(rec, kind, alive)
         m = job_metrics(rec, kind)
         mark = "*" if status == "running" else "!" if status in ("stopped", "crashed") else ""
         res[kind] = {"t": t, "mark": mark, "metrics": m, "return": late_mean(m, "test_return_mean", t // 2)}
     res["marks"] = "".join(s for s in "*!" if s in res["qmix"]["mark"] + res["blame"]["mark"])
-    t_half = res["blame"]["t"] // 2
-    for q, _ in QUESTIONS:
-        for who in WHO:
-            for where, _ in SETS:
-                cms = counts(res["blame"]["metrics"], q, who, where)
-                late = [c for t, c in cms if t >= t_half] or [c for _, c in cms[-1:]]
-                pooled = [[sum(c[i][j] for c in late) for j in range(len(c))] for i, c in enumerate(late[0])] if late else [[0]]
-                res["scores"][q, who, where] = measures(pooled, q == "blame")
-                res["curves"][q, who, where] = list(zip(*[(t, *measures(c, q == "blame")[:2]) for t, c in cms])) or ([], [], [])
+    m, t_half = res["blame"]["metrics"], res["blame"]["t"] // 2
+
+    def scored(q, who, where):
+        """(measures pooled over the second half, (steps, accuracy, majority) curve) of a question on one set."""
+        cms = counts(m, q, who, where)
+        late = [c for t, c in cms if t >= t_half] or [c for _, c in cms[-1:]]
+        pooled = [[sum(c[i][j] for c in late) for j in range(len(c))] for i, c in enumerate(late[0])] if late else [[0]]
+        return measures(pooled, q == "blame"), list(zip(*[(t, *measures(c, q == "blame")[:2]) for t, c in cms])) or ([], [], [])
+
+    def rank(who, where):
+        """The ranked blame measures (auc, sensitivity, specificity) pooled over the second half, on one set."""
+        hs = hist(m, who, where)
+        late = [(P, N) for t, P, N in hs if t >= t_half] or [(P, N) for _, P, N in hs[-1:]]
+        if not late:
+            return (float("nan"),) * 3
+        return ranked(*[[sum(h[i][j] for h in late) for j in range(len(P_BINS) - 1)] for i in range(2)])
+
+    where = "held_out_" if counts(m, "blame", "vote", "held_out_") else ""   # metric prefix of the set that is shown
+    res["set"] = "held-out" if where else "training"
     for who in WHO:
-        for where, _ in SETS:
-            hs = hist(res["blame"]["metrics"], who, where)
-            late = [(P, N) for t, P, N in hs if t >= t_half] or [(P, N) for _, P, N in hs[-1:]]
-            pooled = [[sum(h[i][j] for h in late) for j in range(len(P_BINS) - 1)] for i in range(2)] if late else None
-            res["ranked"][who, where] = ranked(*pooled) if pooled else (float("nan"),) * 3
-            res["auc_curve"][who, where] = list(zip(*[(t, ranked(P, N)[0]) for t, P, N in hs])) or ([], [])
+        for q, _ in QUESTIONS:
+            res["scores"][q, who], res["curves"][q, who] = scored(q, who, where)
+        res["ranked"][who] = rank(who, where)
+        res["gap"][who] = (float("nan"),) * 2
+        if where:
+            res["gap"][who] = (scored("importance", who, "")[0][0] - res["scores"]["importance", who][0],
+                               rank(who, "")[0] - res["ranked"][who][0])
     return res
 
 
 def summary(recs, folder, title):
-    """Print and save one table (per run: each agent's answers and the team vote, on the training batches and on
-    the held-out test episodes; plus their MEAN if there are several runs) and the plot."""
+    """Print and save one table (per run: each agent's answers and the team vote, graded on the held-out test
+    episodes; plus their MEAN if there are several runs) and the plot."""
     results = [run_result(rec, live_jobs()) for rec in recs]
     w = max(len(rec["id"]) for rec in recs) + 4  # room for the ID and its marks
 
-    def rows(first, seed, t_max, qmix, blame, scores, ranks):
+    def rows(first, seed, t_max, qmix, blame, r, note=""):
         lines = []
-        for where, label in SETS:
-            for who in WHO:
-                if all(x != x for q, _ in QUESTIONS for x in scores[q, who, where]):
-                    continue  # nothing logged for this set (a run from before held-out grading)
-                left = f"{first:<{w}}{seed:<6}{t_max:<12}{qmix:<8.3f}{blame:<9.3f}" if not lines else " " * (w + 35)
-                cells = "".join(f"{'{:.3f}/{:.3f} {:.3f}/{:.3f}'.format(*scores[q, who, where]):<24}" for q, _ in QUESTIONS)
-                auc, sens, spec = ranks[who, where]
-                cells += f"{auc:.3f} {sens:.3f}/{spec:.3f}" if auc == auc else ""  # blank for runs without the histogram
-                lines.append(f"   {left}{label + who:<15}{cells}".rstrip())
+        for who in WHO:
+            left = f"{first:<{w}}{seed:<6}{t_max:<12}{qmix:<8.3f}{blame:<9.3f}" if not lines else " " * (w + 35)
+            cells = "".join(f"{'{:.3f}/{:.3f} {:.3f}/{:.3f}'.format(*r['scores'][q, who]):<24}" for q, _ in QUESTIONS)
+            auc, sens, spec = r["ranked"][who]
+            cells += f"{f'{auc:.3f} {sens:.3f}/{spec:.3f}' if auc == auc else '':<22}"   # blank without the histogram
+            cells += "  ".join(f"{x:+.3f}" for x in r["gap"][who] if x == x)               # blank without held-out data
+            lines.append(f"   {left}{who + note:<15}{cells}".rstrip())
         return lines
 
+    def averaged(key, n):
+        return {k: tuple(mean(r[key][k][i] for r in results) for i in range(n)) for k in results[0][key]}
+
     out = [title, "",
-           f"   {'run':<{w}}{'seed':<6}{'t_max':<12}{'qmix':<8}{'blame':<9}{'':<15}" + "".join(f"{q:<24}" for q, _ in QUESTIONS) + "blame ranked",
-           f"   {'':<{w}}{'':<6}{'':<12}{'return':<8}{'return':<9}{'':<15}" + "acc/maj     sens/spec   " * len(QUESTIONS) + "auc   sens/spec@rate"]
+           f"   {'run':<{w}}{'seed':<6}{'t_max':<12}{'qmix':<8}{'blame':<9}{'':<15}" + "".join(f"{q:<24}" for q, _ in QUESTIONS)
+           + f"{'blame ranked':<22}train - held-out",
+           f"   {'':<{w}}{'':<6}{'':<12}{'return':<8}{'return':<9}{'':<15}" + "acc/maj     sens/spec   " * len(QUESTIONS)
+           + f"{'auc   sens/spec@rate':<22}imp acc  blame auc"]
     for r in results:
         rec = r["rec"]
-        out += rows(f"{rec['id']} {r['marks']}", rec["seed"], f"{rec['t_max']:,}", r["qmix"]["return"], r["blame"]["return"],
-                    r["scores"], r["ranked"])
+        out += rows(f"{rec['id']} {r['marks']}", rec["seed"], f"{rec['t_max']:,}", r["qmix"]["return"], r["blame"]["return"], r,
+                    "" if r["set"] == "held-out" else " (train)")
     if len(results) > 1:
         out += rows("MEAN", "", "", mean(r["qmix"]["return"] for r in results), mean(r["blame"]["return"] for r in results),
-                    {key: tuple(mean(r["scores"][key][i] for r in results) for i in range(4)) for key in results[0]["scores"]},
-                    {key: tuple(mean(r["ranked"][key][i] for r in results) for i in range(3)) for key in results[0]["ranked"]})
+                    {"scores": averaged("scores", 4), "ranked": averaged("ranked", 3), "gap": averaged("gap", 2)})
     out += [""] + LEGEND
     print("\n".join(out))
 
@@ -209,10 +223,9 @@ def band(ax, series, colour, style="-", label=None, width=1.5):
 
 
 def plot(results, path, title):
-    """Left: test return of both jobs. Right: a panel per question (columns) and who (rows), with accuracy on the
-    training batches (colour), on the held-out test episodes (colour, dotted) and the majority baseline (grey
-    dashed); the blame panels also show the held-out AUC (dark dashed). Lines are the mean over the runs, bands
-    their min-max range."""
+    """Left: test return of both jobs. Right: a panel per question (columns) and who (rows), with the accuracy
+    (colour) and the majority baseline (grey dashed) on the held-out test episodes. Lines are the mean over the
+    runs, bands their min-max range."""
     layout = [["return"] + [f"{q}_{who}" for q, _ in QUESTIONS] for who in WHO]
     fig, ax = plt.subplot_mosaic(layout, figsize=(17, 6.5), width_ratios=[2] + [1] * len(QUESTIONS), sharex=True)
     for kind in KINDS:
@@ -223,11 +236,8 @@ def plot(results, path, title):
     for q, colour in QUESTIONS:
         for who in WHO:
             a = ax[f"{q}_{who}"]
-            band(a, [r["curves"][q, who, ""][:2] for r in results], colour, label="accuracy")
-            band(a, [r["curves"][q, who, "held_out_"][:2] for r in results], colour, ":", "held-out accuracy")
-            band(a, [r["curves"][q, who, ""][::2] for r in results], GREY, "--", "majority baseline", 1)
-            if q == "blame":
-                band(a, [r["auc_curve"][who, "held_out_"] for r in results], "#1d2127", "--", "AUC held-out", 1.2)
+            band(a, [r["curves"][q, who][:2] for r in results], colour, label="accuracy")
+            band(a, [r["curves"][q, who][::2] for r in results], GREY, "--", "majority baseline", 1)
             a.set_title(f"{q}: {who}")
     ax["return"].set_title("test return")
     ax["return"].set_xlim(left=0)
@@ -239,7 +249,9 @@ def plot(results, path, title):
             a.set_xlabel("environment steps")
         if name in ("return", f"{QUESTIONS[0][0]}_{WHO[0]}"):
             a.legend(fontsize=8, frameon=False)
-    fig.suptitle(f"{title}  ({len(results)} run{'s' if len(results) != 1 else ''}: line = mean, band = min to max)")
+    sets = " / ".join(sorted({r["set"] for r in results}))
+    fig.suptitle(f"{title}  ({len(results)} run{'s' if len(results) != 1 else ''}: line = mean, band = min to max; "
+                 f"heads graded on {sets} episodes)")
     fig.tight_layout()
     fig.savefig(path, dpi=120)
     plt.close(fig)

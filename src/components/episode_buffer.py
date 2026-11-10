@@ -241,19 +241,6 @@ class ReplayBuffer(EpisodeBatch):
             ep_ids = np.random.choice(self.episodes_in_buffer, batch_size, replace=False)
             return self[ep_ids]
 
-    def newest(self, n):
-        """The n most recently inserted episodes, oldest first: the slots just before buffer_index, wrapping round."""
-        assert self.can_sample(n)
-        return self[np.array([(self.buffer_index - n + i) % self.buffer_size for i in range(n)])]
-
-    def oldest(self, n, fraction=0.25):
-        """n episodes drawn at random from the oldest fraction of the buffer (at least n episodes).  Once the buffer
-        is full the oldest slot is buffer_index, the next one to be overwritten; before that it is slot 0."""
-        assert self.can_sample(n)
-        span = max(n, int(self.episodes_in_buffer * fraction))
-        start = self.buffer_index if self.episodes_in_buffer == self.buffer_size else 0
-        return self[(start + np.random.choice(span, n, replace=False)) % self.buffer_size]
-
     def __repr__(self):
         return "ReplayBuffer. {}/{} episodes. Keys:{} Groups:{}".format(self.episodes_in_buffer,
                                                                         self.buffer_size,

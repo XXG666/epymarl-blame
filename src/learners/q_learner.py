@@ -49,9 +49,7 @@ class QLearner:
             rew_shape = (1,) if self.args.common_reward else (self.n_agents,)
             self.rew_ms = RunningMeanStd(shape=rew_shape, device=device)
 
-    def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, head_batch: EpisodeBatch = None):
-        """One update on the sampled batch.  head_batch (head_batch = newest / oldest in the config): the episodes
-        the blame heads learn from instead of the sampled batch; Q learning is unchanged."""
+    def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
         # Get the relevant quantities
         rewards = batch["reward"][:, :-1]
         actions = batch["actions"][:, :-1]
@@ -189,20 +187,12 @@ class QLearner:
                     3, actions, dL_dQa.unsqueeze(3) # "=" assign the value
 )
                 # --- blame and importance ---
-                # the sub-heads judge step t at step t+1 (slot 1 onwards); there the agent's heads read
-                # [ h_t | h_{t+1} ], the situation when it acted and the situation with the step's outcome in view.
-                # Their labels come from the TD error and dL/dQ_a of the batch they read: the sampled batch,
-                # whose signal the interrupted backward pass just produced, or a batch of their own (head_batch),
-                # whose signal _credit computes with the current networks without learning anything from it.
-                if head_batch is None:
-                    b = mac_out[:, 1:, :, self.args.n_actions :]          # [ blame logit | importance logits ]
-                    delta, g, head_mask = td_error[..., 0].detach(), dL_dQa.detach(), mask
-                else:
-                    head_out = self._rollout(self.mac, head_batch)        # with a graph: the heads learn from it
-                    b = head_out[:, 1:, :, self.args.n_actions :]
-                    delta, g, head_mask = self._credit(head_batch, head_out)   # delta and dL/dQ_a of those episodes
-                real, blame_target = self._blame_target(delta, head_mask)
-                defined, imp_target = self._importance_target(g, head_mask)
+                # the sub-heads judge step t at step t+1 (slot 1 onwards): there the agent's hidden state h_{t+1}
+                # has the step's outcome in view.  Their labels come from the TD error and dL/dQ_a that the
+                # interrupted backward pass just produced for this batch.
+                b = mac_out[:, 1:, :, self.args.n_actions :]              # [ blame logit | importance logits ]
+                real, blame_target = self._blame_target(td_error[..., 0].detach(), mask)
+                defined, imp_target = self._importance_target(dL_dQa.detach(), mask)
                 blame_loss = self._blame_loss(b[..., 0], blame_target, real)
                 imp_loss = self._importance_loss(b[..., 1:], imp_target, defined)
                 if t_env - self.log_stats_t >= self.args.learner_log_interval:
@@ -255,12 +245,28 @@ class QLearner:
     # dL/dQ_a = (2/|T|) * delta * dQ_tot/dQ_a.  Every agent judges the same step from its own view, so all
     # agents share each target (batch, steps).
     # ------------------------------------------------------------------------------------------------
+    @staticmethod
+    def _window(x, real, n):
+        """With n > 1, the sum of x over the n steps ending at each step, and whether all n of them are real; with
+        n = 1, x and real unchanged.  x: (batch, steps) or (batch, steps, agents); real: (batch, steps).
+        Padding is zeroed first so that nothing leaks into a window, and the first n - 1 steps of an episode have no
+        full window, so they carry no label."""
+        if n <= 1:
+            return x, real
+        x = x * (real.unsqueeze(-1) if x.dim() == 3 else real)
+        c = th.cumsum(x, 1)
+        s = c - th.cat([th.zeros_like(c[:, :n]), c[:, :-n]], 1)                # c_t - c_{t-n}: the sum over t-n+1 .. t
+        cr = th.cumsum(real.float(), 1)
+        full = (cr - th.cat([th.zeros_like(cr[:, :n]), cr[:, :-n]], 1)) == n   # n real steps in the window
+        return s, full
+
     def _blame_target(self, delta, mask):
         """blame: did the team do worse than predicted at this step?  1 or 0, from delta (batch, steps), as delta > tau.
-        blame_threshold > 0 fixes tau (standardised reward units).  Else blame_margin k > 0 sets it to the batch's
-        median plus k robust standard deviations (1.4826 * MAD) of the batch's deltas, a clear miss by the batch's
-        own scale.  Else tau = 0: any step worse than predicted.  Returns (steps that count = real steps, target)."""
-        real = mask[..., 0] > 0
+        With blame_window n > 1, delta is first summed over the n steps ending at the step: did the team fall short
+        over that window.  blame_threshold > 0 fixes tau (standardised reward units).  Else blame_margin k > 0 sets it
+        to the batch's median plus k robust standard deviations (1.4826 * MAD) of the batch's deltas, a clear miss by
+        the batch's own scale.  Else tau = 0: any step worse than predicted.  Returns (steps that count, target)."""
+        delta, real = self._window(delta, mask[..., 0] > 0, getattr(self.args, "blame_window", 1))
         tau = getattr(self.args, "blame_threshold", 0)
         k = getattr(self.args, "blame_margin", 0)
         assert not (tau > 0 and k > 0), "set blame_threshold or blame_margin, not both"
@@ -272,9 +278,13 @@ class QLearner:
 
     def _importance_target(self, dL_dQa, mask):
         """importance: which agent has the largest mixer weight dQ_tot/dQ_a?  Since delta is shared by the agents,
-        that is the largest |dL/dQ_a|.  Returns (steps that count = real steps where delta != 0, target index)."""
-        defined = (mask[..., 0] > 0) & (dL_dQa.abs().sum(-1) > 0)
-        return defined, dL_dQa.abs().argmax(-1)
+        that is the largest |dL/dQ_a|.  With importance_window n > 1, dL/dQ_a is first summed over the n steps ending
+        at the step: which agent accumulated the most credit over that window.  That sum is decided mostly by the
+        window's most surprising step, good or bad, so by default importance stays a one-step label even when blame
+        uses a window.  Returns (steps that count = steps with a label where delta != 0, target index)."""
+        g, real = self._window(dL_dQa, mask[..., 0] > 0, getattr(self.args, "importance_window", 1))
+        defined = real & (g.abs().sum(-1) > 0)
+        return defined, g.abs().argmax(-1)
 
     def _blame_loss(self, logit, target, steps):
         """BCE between the blame logits (batch, time, agent) and the shared 0/1 target over the counted steps:
