@@ -20,7 +20,19 @@ LINE = {"qmix": (GREY, "--", "benchmark QMIX"), "blame": ("#2a78d6", "-", "blame
 QUESTIONS = [("blame", "#e87ba4"), ("importance", "#eda100"), ("combined", "#1baf7a")]
 
 
-WHO = ["each", "vote"]
+WHO = ["each", "vote"]  # the agents' answers as logged: every agent's own, the team's majority vote
+
+
+BASELINE = "central"  # the centralised head, the upper limit, as logged
+
+
+NAIVE = "naive"  # the naive method, random guesses, as logged
+
+
+EXTRA = [BASELINE, NAIVE]  # shown after the agents' answers, when a run has them
+
+
+LABEL = {"each": "each", "vote": "maj", BASELINE: "baseline", NAIVE: "naive"}  # as shown
 
 
 LEGEND = [
@@ -28,9 +40,13 @@ LEGEND = [
     "   return     = test return (1.0 = all food collected)",
     "   blame      = did the team do worse than predicted (1) or not (0);  importance = which agent has the largest mixer weight",
     "   combined   = the final answer: the most important agent if blame, else nobody",
-    "   each       = every agent's own answer;  vote = the team's majority vote",
-    "   acc/maj    = accuracy / the majority baseline (always give the most common answer)",
-    "   sens/spec  = sensitivity / specificity (blame: answer 1 is positive; importance, combined: macro-averaged over the answers)",
+    "   each       = every agent's own answer;  maj = the team's majority vote",
+    "   baseline   = the upper limit: a centralised head that reads the global state and all agents' hidden states",
+    "   naive      = the naive method: says blame or not with probability 1/2, names each agent with equal probability",
+    "                all graded on the held-out test episodes (epsilon 0.05), which nothing is trained on;",
+    "                (train) = graded on the training batches instead, because a run in this summary has no held-out data",
+    "   acc        = accuracy: the share of answers that are right",
+    "   sens/spec  = sensitivity / specificity of the blame answer (answer 1, blame, is the positive)",
     "   *  still running (not final)    !  stopped or crashed",
 ]
 
@@ -46,31 +62,33 @@ def late_mean(m, key, t_from):
     return mean([v for t, v in zip(s["steps"], s["values"]) if t >= t_from] or s["values"][-1:])
 
 
-def counts(m, q, who):
-    """[(step, k x k confusion matrix)] of a question at every log point; rows = truth, columns = answer."""
-    keys = [k for k in m if k.startswith(f"cm_{q}_{who}_")]
+def counts(m, q, who, where=""):
+    """[(step, k x k confusion matrix)] of a question at every log point; rows = truth, columns = answer.
+    where = "" for the training batches, "held_out_" for the test episodes."""
+    keys = [k for k in m if k.startswith(f"cm_{where}{q}_{who}_")]
     k = max((int(key.split("_")[-1]) + 1 for key in keys), default=0)
-    cell = lambda i, j, n: m[f"cm_{q}_{who}_{i}_{j}"]["values"][n]
+    cell = lambda i, j, n: m[f"cm_{where}{q}_{who}_{i}_{j}"]["values"][n]
     return [(t, [[cell(i, j, n) for j in range(k)] for i in range(k)]) for n, t in enumerate(m[keys[0]]["steps"])] if keys else []
 
 
-def measures(c, binary):
-    """(accuracy, majority baseline, sensitivity, specificity) of one confusion matrix.
-    binary: plain sens/spec with answer 1 as the positive; otherwise macro-averaged over the answers."""
-    k, total = len(c), sum(map(sum, c))
+def measures(c):
+    """(accuracy, sensitivity, specificity) of one confusion matrix; rows = truth, columns = answer.
+    Sensitivity and specificity are for a yes/no question, with answer 1 as the positive; nan for the others."""
+    nan, total = float("nan"), sum(map(sum, c))
     if not total:
-        return (float("nan"),) * 4
-    rows = [sum(r) for r in c]
-    cols = [sum(c[i][j] for i in range(k)) for j in range(k)]
-    answers = [1] if binary else range(k)
-    sens = mean(c[i][i] / rows[i] for i in answers if rows[i])
-    spec = mean((total - rows[i] - cols[i] + c[i][i]) / (total - rows[i]) for i in answers if total - rows[i])
-    return sum(c[i][i] for i in range(k)) / total, max(rows) / total, sens, spec
+        return nan, nan, nan
+    acc = sum(c[i][i] for i in range(len(c))) / total
+    if len(c) != 2:
+        return acc, nan, nan
+    return acc, c[1][1] / sum(c[1]) if sum(c[1]) else nan, c[0][0] / sum(c[0]) if sum(c[0]) else nan
 
 
-def run_result(rec, alive):
-    """Per job: steps reached, mark, metrics, late test return. Per (question, who): the measures pooled over the
-    second half of the blame job's steps ("scores"), and (steps, accuracy, majority) at every log point ("curves")."""
+def run_result(rec, alive, held_out=True):
+    """Per job: steps reached, mark, metrics, late test return.  The blame job's heads are graded on the held-out
+    test episodes when the run has them and held_out is set ("set" = "held-out"), else on its training batches
+    ("training"); "set" is None while the job has logged no counts at all.
+    Per (question, who): the measures pooled over the second half of the job's steps ("scores"), and (steps,
+    accuracy) at every log point ("curves")."""
     res = {"rec": rec, "scores": {}, "curves": {}}
     for kind in KINDS:
         status, t = job_state(rec, kind, alive)
@@ -78,46 +96,73 @@ def run_result(rec, alive):
         mark = "*" if status == "running" else "!" if status in ("stopped", "crashed") else ""
         res[kind] = {"t": t, "mark": mark, "metrics": m, "return": late_mean(m, "test_return_mean", t // 2)}
     res["marks"] = "".join(s for s in "*!" if s in res["qmix"]["mark"] + res["blame"]["mark"])
-    t_half = res["blame"]["t"] // 2
-    for q, _ in QUESTIONS:
-        for who in WHO:
-            cms = counts(res["blame"]["metrics"], q, who)
-            late = [c for t, c in cms if t >= t_half] or [c for _, c in cms[-1:]]
-            pooled = [[sum(c[i][j] for c in late) for j in range(len(c))] for i, c in enumerate(late[0])] if late else [[0]]
-            res["scores"][q, who] = measures(pooled, q == "blame")
-            res["curves"][q, who] = list(zip(*[(t, *measures(c, q == "blame")[:2]) for t, c in cms])) or ([], [], [])
+    m, t_half = res["blame"]["metrics"], res["blame"]["t"] // 2
+
+    def scored(q, who, where):
+        """(measures pooled over the second half, (steps, accuracy) curve) of a question on one set."""
+        cms = counts(m, q, who, where)
+        late = [c for t, c in cms if t >= t_half] or [c for _, c in cms[-1:]]
+        pooled = [[sum(c[i][j] for c in late) for j in range(len(c))] for i, c in enumerate(late[0])] if late else [[0]]
+        return measures(pooled), list(zip(*[(t, measures(c)[0]) for t, c in cms])) or ([], [])
+
+    where = "held_out_" if held_out and counts(m, "blame", "vote", "held_out_") else ""   # metric prefix of the set shown
+    res["set"] = "held-out" if where else "training" if counts(m, "blame", "vote") else None   # None: nothing logged yet
+    for who in WHO + EXTRA:
+        for q, _ in QUESTIONS:
+            res["scores"][q, who], res["curves"][q, who] = scored(q, who, where)
     return res
 
 
 def summary(recs, folder, title):
-    """Print and save one table (two lines per run: each agent's answers, the team vote; plus their MEAN if there
-    are several runs) and the plot."""
+    """Print and save one table (per run: each agent's answers, the team's majority vote, the baseline and the naive method, graded on the held-out
+    test episodes; plus their MEAN if there are several runs) and the plot.  If some of the runs have no held-out
+    data, all of them are graded on their training batches instead, so that the MEAN and the plot compare like
+    with like."""
     results = [run_result(rec, live_jobs()) for rec in recs]
+    sets = {r["set"] for r in results} - {None}
+    if len(sets) > 1:
+        results = [run_result(rec, live_jobs(), held_out=False) for rec in recs]
+    graded = "held-out" if sets == {"held-out"} else "training"
+    note = "" if graded == "held-out" else " (train)"
+    # the baseline and the naive method are shown in the MEAN and the plot only if every run with head data has them
+    shown = [who for who in EXTRA if all(r["curves"]["blame", who][0] for r in results if r["set"])]
     w = max(len(rec["id"]) for rec in recs) + 4  # room for the ID and its marks
+
+    def cell(q, score):
+        """Accuracy for every question; sensitivity/specificity as well for blame, the yes/no question."""
+        acc, sens, spec = score
+        return f"{acc:<7.3f}{sens:.3f}/{spec:.3f}  " if q == "blame" else f"{acc:<12.3f}"
 
     def rows(first, seed, t_max, qmix, blame, scores):
         lines = []
-        for i, who in enumerate(WHO):
+        for i, who in enumerate(WHO + EXTRA):
+            if who in EXTRA and all(x != x for q, _ in QUESTIONS for x in scores[q, who]):
+                continue  # a run from before the baseline or the naive method
             left = f"{first:<{w}}{seed:<6}{t_max:<12}{qmix:<8.3f}{blame:<9.3f}" if i == 0 else " " * (w + 35)
-            cells = "".join(f"{'{:.3f}/{:.3f} {:.3f}/{:.3f}'.format(*scores[q, who]):<24}" for q, _ in QUESTIONS)
-            lines.append(f"   {left}{who:<6}{cells}".rstrip())
+            cells = "".join(cell(q, scores[q, who]) for q, _ in QUESTIONS)
+            lines.append(f"   {left}{LABEL[who] + note:<18}{cells}".rstrip())
         return lines
 
+    widths = {q: len(cell(q, (0, 0, 0))) for q, _ in QUESTIONS}
     out = [title, "",
-           f"   {'run':<{w}}{'seed':<6}{'t_max':<12}{'qmix':<8}{'blame':<9}{'':<6}" + "".join(f"{q:<24}" for q, _ in QUESTIONS).rstrip(),
-           f"   {'':<{w}}{'':<6}{'':<12}{'return':<8}{'return':<9}{'':<6}" + ("acc/maj     sens/spec   " * len(QUESTIONS)).rstrip()]
+           f"   {'run':<{w}}{'seed':<6}{'t_max':<12}{'qmix':<8}{'blame':<9}{'':<18}"
+           + "".join(f"{q:<{widths[q]}}" for q, _ in QUESTIONS).rstrip(),
+           f"   {'':<{w}}{'':<6}{'':<12}{'return':<8}{'return':<9}{'':<18}"
+           + "".join(f"{'acc    sens/spec' if q == 'blame' else 'acc':<{widths[q]}}" for q, _ in QUESTIONS).rstrip()]
     for r in results:
         rec = r["rec"]
-        out += rows(f"{rec['id']} {r['marks']}", rec["seed"], f"{rec['t_max']:,}", r["qmix"]["return"], r["blame"]["return"], r["scores"])
+        out += rows(f"{rec['id']} {r['marks']}", rec["seed"], f"{rec['t_max']:,}", r["qmix"]["return"], r["blame"]["return"],
+                    r["scores"])
     if len(results) > 1:
         out += rows("MEAN", "", "", mean(r["qmix"]["return"] for r in results), mean(r["blame"]["return"] for r in results),
-                    {key: tuple(mean(r["scores"][key][i] for r in results) for i in range(4)) for key in results[0]["scores"]})
+                    {key: tuple(mean(r["scores"][key][i] for r in results) if key[1] in WHO + shown else float("nan")
+                                for i in range(3)) for key in results[0]["scores"]})
     out += [""] + LEGEND
     print("\n".join(out))
 
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "summary.txt").write_text("\n".join(out) + "\n")
-    plot(results, folder / "summary.png", title)
+    plot(results, folder / "summary.png", title, graded, shown)
     print(f"\nsaved in {folder.relative_to(ROOT)}/")
     return results
 
@@ -151,9 +196,10 @@ def band(ax, series, colour, style="-", label=None, width=1.5):
         ax.fill_between(grid, np.nanmin(rows, 0), np.nanmax(rows, 0), color=colour, alpha=0.15, linewidth=0)
 
 
-def plot(results, path, title):
-    """Left: test return of both jobs. Right: a panel per question (columns) and who (rows), with accuracy (colour)
-    and the majority baseline (grey dashed). Lines are the mean over the runs, bands their min-max range."""
+def plot(results, path, title, graded, shown):
+    """Left: test return of both jobs. Right: a panel per question (columns) and who (rows) with the accuracy on
+    the held-out test episodes (colour), the baseline (grey dashed) and the naive method (grey dotted).
+    Lines are the mean over the runs, bands their min-max range."""
     layout = [["return"] + [f"{q}_{who}" for q, _ in QUESTIONS] for who in WHO]
     fig, ax = plt.subplot_mosaic(layout, figsize=(17, 6.5), width_ratios=[2] + [1] * len(QUESTIONS), sharex=True)
     for kind in KINDS:
@@ -164,9 +210,11 @@ def plot(results, path, title):
     for q, colour in QUESTIONS:
         for who in WHO:
             a = ax[f"{q}_{who}"]
-            band(a, [r["curves"][q, who][:2] for r in results], colour, label="accuracy")
-            band(a, [r["curves"][q, who][::2] for r in results], GREY, "--", "majority baseline", 1)
-            a.set_title(f"{q}: {who}")
+            band(a, [r["curves"][q, who] for r in results], colour, label="agents")
+            for who_extra, style in ((BASELINE, "--"), (NAIVE, ":")):
+                if who_extra in shown:
+                    band(a, [r["curves"][q, who_extra] for r in results], GREY, style, LABEL[who_extra], 1.2)
+            a.set_title(f"{q} accuracy: {LABEL[who]}")
     ax["return"].set_title("test return")
     ax["return"].set_xlim(left=0)
     for name, a in ax.items():
@@ -177,7 +225,8 @@ def plot(results, path, title):
             a.set_xlabel("environment steps")
         if name in ("return", f"{QUESTIONS[0][0]}_{WHO[0]}"):
             a.legend(fontsize=8, frameon=False)
-    fig.suptitle(f"{title}  ({len(results)} run{'s' if len(results) != 1 else ''}: line = mean, band = min to max)")
+    fig.suptitle(f"{title}  ({len(results)} run{'s' if len(results) != 1 else ''}: line = mean, band = min to max; "
+                 f"heads graded on {graded} episodes)")
     fig.tight_layout()
     fig.savefig(path, dpi=120)
     plt.close(fig)
