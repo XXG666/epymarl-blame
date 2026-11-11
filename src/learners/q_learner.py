@@ -97,7 +97,7 @@ class QLearner:
             hidden.append(self.mac.hidden_states)
         mac_out = th.stack(mac_out, dim=1)  # Concat over time
 
-        # --- split the combined [ Q | blame | importance ] output ---
+        # --- split the combined [ Q | whether | who ] output ---
         n_blame = getattr(self.args, "n_blame_outputs", 0)
         if n_blame > 0:
             q_out = mac_out[..., :-n_blame]
@@ -206,23 +206,23 @@ class QLearner:
                 full_grad[:, :-1, :, : self.args.n_actions].scatter_(
                     3, actions, dL_dQa.unsqueeze(3) # "=" assign the value
 )
-                # --- blame and importance, read from the interrupted signal ---
+                # --- whether and who, read from the interrupted signal ---
                 # the sub-heads judge step t at step t+1 (mac_out[:, 1:]), with the step's outcome in view
-                b = mac_out[:, 1:, :, self.args.n_actions :]              # [ blame logit | importance logits ]
+                b = mac_out[:, 1:, :, self.args.n_actions :]              # [ whether logit | who logits ]
                 g = dL_dQa.detach()
-                real, blame_target = self._blame_target(g, mask)
-                defined, imp_target = self._importance_target(g, mask)
-                blame_loss = self._blame_loss(b[..., 0], blame_target, real)
-                imp_loss = self._importance_loss(b[..., 1:], imp_target, defined)
-                central_out = self._central_train(self._central_input(batch, hidden), blame_target, imp_target, real, defined)
+                real, whether_target = self._whether_target(g, mask)
+                defined, who_target = self._who_target(g, mask)
+                whether_loss = self._whether_loss(b[..., 0], whether_target, real)
+                who_loss = self._who_loss(b[..., 1:], who_target, defined)
+                central_out = self._central_train(self._central_input(batch, hidden), whether_target, who_target, real, defined)
                 if t_env - self.log_stats_t >= self.args.learner_log_interval:
-                    self.logger.log_stat("blame_loss", blame_loss.item(), t_env)
-                    self.logger.log_stat("importance_loss", imp_loss.item(), t_env)
-                    self._log_answers(b, blame_target, imp_target, real, defined, t_env)
-                    self._log_central(central_out, blame_target, imp_target, real, defined, t_env)
-                    self._log_naive(blame_target, imp_target, real, defined, t_env)
+                    self.logger.log_stat("whether_loss", whether_loss.item(), t_env)
+                    self.logger.log_stat("who_loss", who_loss.item(), t_env)
+                    self._log_answers(b, whether_target, who_target, real, defined, t_env)
+                    self._log_central(central_out, whether_target, who_target, real, defined, t_env)
+                    self._log_naive(whether_target, who_target, real, defined, t_env)
                 # resume: autograd adds the TD gradient (full_grad) and the two losses' gradient, one pass
-                th.autograd.backward([mac_out, blame_loss + imp_loss], [full_grad, None])
+                th.autograd.backward([mac_out, whether_loss + who_loss], [full_grad, None])
             else:
                 q_agents.backward(gradient=dL_dQa)
         else:
@@ -266,24 +266,24 @@ class QLearner:
     # Two sub-heads trained on the interrupted gradient dL/dQ_a = (2/|T|) * delta * dQ_tot/dQ_a.
     # Every agent judges the same step from its own view, so all agents share each target (batch, time).
     # ------------------------------------------------------------------------------------------------
-    def _blame_target(self, dL_dQa, mask):
-        """blame: did the team do worse than predicted at this step (dL/dQ_a > 0)?  1 or 0.
+    def _whether_target(self, dL_dQa, mask):
+        """whether: did the team do worse than predicted at this step (dL/dQ_a > 0)?  1 or 0.
         Returns (steps that count = real steps, target)."""
         real = mask[..., 0] > 0
         return real, (dL_dQa.max(-1).values > 0).float()
 
-    def _importance_target(self, dL_dQa, mask):
-        """importance: which agent has the largest mixer weight dQ_tot/dQ_a?  Since delta is shared by the agents,
+    def _who_target(self, dL_dQa, mask):
+        """who: which agent has the largest mixer weight dQ_tot/dQ_a?  Since delta is shared by the agents,
         that is the largest |dL/dQ_a|.  Returns (steps that count = real steps where delta != 0, target index)."""
         defined = (mask[..., 0] > 0) & (dL_dQa.abs().sum(-1) > 0)
         return defined, dL_dQa.abs().argmax(-1)
 
-    def _blame_loss(self, logit, target, steps):
-        """BCE between the blame logit (batch, time, agent) and the shared 0/1 target, over the counted steps."""
+    def _whether_loss(self, logit, target, steps):
+        """BCE between the whether logit (batch, time, agent) and the shared 0/1 target, over the counted steps."""
         return F.binary_cross_entropy_with_logits(logit[steps], target.unsqueeze(2).expand_as(logit)[steps])
 
-    def _importance_loss(self, logits, target, steps):
-        """Cross-entropy between the importance logits (batch, time, agent, n_agents) and the shared target index."""
+    def _who_loss(self, logits, target, steps):
+        """Cross-entropy between the who logits (batch, time, agent, n_agents) and the shared target index."""
         n_agents = logits.size(-1)
         return F.cross_entropy(logits[steps].reshape(-1, n_agents),
                                target.unsqueeze(2).expand(-1, -1, logits.size(2))[steps].reshape(-1))
@@ -304,13 +304,13 @@ class QLearner:
             mac_out, hidden = self._rollout(self.mac, batch)
         dL_dQa, mask = self._credit(batch, mac_out)
         b = mac_out[:, 1:, :, self.args.n_actions :]
-        real, blame_target = self._blame_target(dL_dQa, mask)
-        defined, imp_target = self._importance_target(dL_dQa, mask)
-        self._log_answers(b, blame_target, imp_target, real, defined, t_env, where="held_out_")
+        real, whether_target = self._whether_target(dL_dQa, mask)
+        defined, who_target = self._who_target(dL_dQa, mask)
+        self._log_answers(b, whether_target, who_target, real, defined, t_env, where="held_out_")
         with th.no_grad():
             central_out = self.central(self._central_input(batch, hidden))
-        self._log_central(central_out, blame_target, imp_target, real, defined, t_env, where="held_out_")
-        self._log_naive(blame_target, imp_target, real, defined, t_env, where="held_out_")
+        self._log_central(central_out, whether_target, who_target, real, defined, t_env, where="held_out_")
+        self._log_naive(whether_target, who_target, real, defined, t_env, where="held_out_")
 
     def _credit(self, batch, mac_out):
         """dL/dQ_a (batch, time, agents) of a batch with the current networks, and the mask of its real steps, for
@@ -370,68 +370,68 @@ class QLearner:
         h = th.stack([x.reshape(batch.batch_size, -1) for x in hidden[1:]], dim=1).detach()
         return th.cat([batch["state"][:, :-1], batch["state"][:, 1:], h], dim=-1)
 
-    def _central_train(self, x, blame_target, imp_target, real, defined):
+    def _central_train(self, x, whether_target, who_target, real, defined):
         """One update of the centralised head on the batch's labels, with its own optimiser.  Returns its outputs
-        from before the update: (batch, steps, [ blame logit | importance logits ])."""
+        from before the update: (batch, steps, [ whether logit | who logits ])."""
         out = self.central(x)
-        loss = (F.binary_cross_entropy_with_logits(out[..., 0][real], blame_target[real])
-                + F.cross_entropy(out[..., 1:][defined], imp_target[defined]))
+        loss = (F.binary_cross_entropy_with_logits(out[..., 0][real], whether_target[real])
+                + F.cross_entropy(out[..., 1:][defined], who_target[defined]))
         self.central_optimiser.zero_grad()
         loss.backward()
         self.central_optimiser.step()
         return out.detach()
 
-    def _log_central(self, out, blame_target, imp_target, real, defined, t_env, where=""):
-        """The centralised head's answers, by the agents' rules: blame if P > 0.5, and the most likely agent."""
-        self._log_team("central", out[..., 0] > 0, out[..., 1:].argmax(-1), blame_target, imp_target, real, defined, t_env, where)
+    def _log_central(self, out, whether_target, who_target, real, defined, t_env, where=""):
+        """The centralised head's answers, by the agents' rules: yes to whether if P > 0.5, and the most likely agent."""
+        self._log_team("central", out[..., 0] > 0, out[..., 1:].argmax(-1), whether_target, who_target, real, defined, t_env, where)
 
-    def _log_naive(self, blame_target, imp_target, real, defined, t_env, where=""):
-        """The naive method's answers: blame or not with probability 1/2 each, and an agent drawn with equal
-        probability, at every step."""
-        shape, device = blame_target.shape, blame_target.device
-        blame = th.randint(0, 2, shape, generator=self.naive_rng).to(device) == 1
-        imp = th.randint(0, self.n_agents, shape, generator=self.naive_rng).to(device)
-        self._log_team("naive", blame, imp, blame_target, imp_target, real, defined, t_env, where)
+    def _log_naive(self, whether_target, who_target, real, defined, t_env, where=""):
+        """The naive method's answers: yes or no to whether with probability 1/2 each, and for who an agent drawn
+        with equal probability, at every step."""
+        shape, device = whether_target.shape, whether_target.device
+        whether = th.randint(0, 2, shape, generator=self.naive_rng).to(device) == 1
+        who = th.randint(0, self.n_agents, shape, generator=self.naive_rng).to(device)
+        self._log_team("naive", whether, who, whether_target, who_target, real, defined, t_env, where)
 
-    def _log_team(self, who, blame, imp, blame_target, imp_target, real, defined, t_env, where=""):
-        """Confusion counts of an answerer that gives one answer per step, logged under the name who.
-        blame (batch, steps): True if it says blame;  imp (batch, steps): the agent it names.
-        Its combined answer is that agent if it says blame, else nobody (index n_agents), as for the agents."""
+    def _log_team(self, by, whether, who, whether_target, who_target, real, defined, t_env, where=""):
+        """Confusion counts of an answerer that gives one answer per step, logged under the name by.
+        whether (batch, steps): True if it says the team did worse;  who (batch, steps): the agent it names.
+        Its combined answer is that agent if whether is True, else nobody (index n_agents), as for the agents."""
         nobody = self.n_agents
-        self._log_cm(where + "blame", who, blame_target.long()[real], blame.long()[real], 2, t_env)
-        self._log_cm(where + "importance", who, imp_target[defined], imp[defined], nobody, t_env)
-        self._log_cm(where + "combined", who, th.where(blame_target == 1, imp_target, nobody)[real],
-                     th.where(blame, imp, nobody)[real], nobody + 1, t_env)
+        self._log_cm(where + "whether", by, whether_target.long()[real], whether.long()[real], 2, t_env)
+        self._log_cm(where + "who", by, who_target[defined], who[defined], nobody, t_env)
+        self._log_cm(where + "combined", by, th.where(whether_target == 1, who_target, nobody)[real],
+                     th.where(whether, who, nobody)[real], nobody + 1, t_env)
 
     # ------------------------------------------------------------------------------------------------
     # Logging: confusion counts of the three questions.  where = "" for training batches, "held_out_" for
     # the test episodes; the metric names become cm_<where><question>_<each|vote>_<truth>_<answer>.
     # ------------------------------------------------------------------------------------------------
-    def _log_answers(self, b, blame_target, imp_target, real, defined, t_env, where=""):
-        """b (batch, time, agent, [ blame logit | importance logits ]) and the targets from _blame_target and
-        _importance_target.  Turns the logits into probabilities and counts each question's answers."""
+    def _log_answers(self, b, whether_target, who_target, real, defined, t_env, where=""):
+        """b (batch, time, agent, [ whether logit | who logits ]) and the targets from _whether_target and
+        _who_target.  Turns the logits into probabilities and counts each question's answers."""
         with th.no_grad():
-            p_blame, p_imp = th.sigmoid(b[..., 0]), th.softmax(b[..., 1:], dim=-1)
-            self._log_blame(p_blame, blame_target, real, t_env, where)
-            self._log_importance(p_imp, imp_target, defined, t_env, where)
-            self._log_combined(p_blame, p_imp, blame_target, imp_target, real, t_env, where)
+            p_whether, p_who = th.sigmoid(b[..., 0]), th.softmax(b[..., 1:], dim=-1)
+            self._log_whether(p_whether, whether_target, real, t_env, where)
+            self._log_who(p_who, who_target, defined, t_env, where)
+            self._log_combined(p_whether, p_who, whether_target, who_target, real, t_env, where)
 
-    def _log_blame(self, p_blame, target, steps, t_env, where=""):
-        """p_blame (batch, time, agent) = P(someone is to blame). Answer: 1 if P > 0.5."""
-        self._log_counts(where + "blame", target.long(), (p_blame > 0.5).long(), th.stack([1 - p_blame, p_blame], -1), steps, t_env)
+    def _log_whether(self, p_whether, target, steps, t_env, where=""):
+        """p_whether (batch, time, agent) = P(the team did worse than predicted). Answer: 1 if P > 0.5."""
+        self._log_counts(where + "whether", target.long(), (p_whether > 0.5).long(), th.stack([1 - p_whether, p_whether], -1), steps, t_env)
 
-    def _log_importance(self, p_imp, target, steps, t_env, where=""):
-        """p_imp (batch, time, agent, n_agents) = P(each agent is the most important). Answer: the most likely."""
-        self._log_counts(where + "importance", target, p_imp.argmax(-1), p_imp, steps, t_env)
+    def _log_who(self, p_who, target, steps, t_env, where=""):
+        """p_who (batch, time, agent, n_agents) = P(each agent is the most important). Answer: the most likely."""
+        self._log_counts(where + "who", target, p_who.argmax(-1), p_who, steps, t_env)
 
-    def _log_combined(self, p_blame, p_imp, blame_target, imp_target, steps, t_env, where=""):
-        """The final answer: the most important agent if blame, else "nobody" (index n_agents).
-        Its probabilities multiply: P(agent k) = P(blame) * P(k | importance), P(nobody) = 1 - P(blame).
-        The truth is the same rule applied to the targets, i.e. the old n + 1 blame target."""
-        nobody = p_imp.size(-1)
-        answer = th.where(p_blame > 0.5, p_imp.argmax(-1), nobody)
-        probs = th.cat([p_blame.unsqueeze(-1) * p_imp, (1 - p_blame).unsqueeze(-1)], dim=-1)
-        truth = th.where(blame_target == 1, imp_target, nobody)
+    def _log_combined(self, p_whether, p_who, whether_target, who_target, steps, t_env, where=""):
+        """The final answer: the agent named by who if whether says yes, else "nobody" (index n_agents).
+        Its probabilities multiply: P(agent k) = P(whether) * P(k | who), P(nobody) = 1 - P(whether).
+        The truth is the same rule applied to the two targets."""
+        nobody = p_who.size(-1)
+        answer = th.where(p_whether > 0.5, p_who.argmax(-1), nobody)
+        probs = th.cat([p_whether.unsqueeze(-1) * p_who, (1 - p_whether).unsqueeze(-1)], dim=-1)
+        truth = th.where(whether_target == 1, who_target, nobody)
         self._log_counts(where + "combined", truth, answer, probs, steps, t_env)
 
     def _log_counts(self, name, truth, answer, probs, steps, t_env):
@@ -440,15 +440,15 @@ class QLearner:
         k = probs.size(-1)
         vote = self._vote(answer, probs, k)
         t_each = truth.unsqueeze(2).expand_as(answer)[steps]              # one truth per (step, agent)
-        for who, ans, tru in (("each", answer[steps], t_each), ("vote", vote[steps], truth[steps])):
-            self._log_cm(name, who, tru, ans, k, t_env)
+        for by, ans, tru in (("each", answer[steps], t_each), ("vote", vote[steps], truth[steps])):
+            self._log_cm(name, by, tru, ans, k, t_env)
 
-    def _log_cm(self, name, who, truth, answer, k, t_env):
-        """Log one k x k confusion matrix as cm_<name>_<who>_<truth>_<answer>."""
+    def _log_cm(self, name, by, truth, answer, k, t_env):
+        """Log one k x k confusion matrix as cm_<name>_<by>_<truth>_<answer>."""
         counts = th.bincount(truth.reshape(-1) * k + answer.reshape(-1), minlength=k * k)   # row = truth, col = answer
         for i in range(k):
             for j in range(k):
-                self.logger.log_stat(f"cm_{name}_{who}_{i}_{j}", counts[i * k + j].item(), t_env)
+                self.logger.log_stat(f"cm_{name}_{by}_{i}_{j}", counts[i * k + j].item(), t_env)
 
     @staticmethod
     def _vote(answers, probs, k):

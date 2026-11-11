@@ -16,18 +16,18 @@ class RNNAgent(nn.Module):
             self.rnn = nn.Linear(args.hidden_dim, args.hidden_dim)
         self.fc2 = nn.Linear(args.hidden_dim, args.n_actions)  # the Q head, exactly as in plain QMIX
 
-        # Output per step: [ Q (n_actions) | blame (1) | importance (n_agents) ]
+        # Output per step: [ Q (n_actions) | whether (1) | who (n_agents) ]
         # The two blame sub-heads read the hidden state like the Q head; the learner trains their output at step
         # t+1 on step t, so they judge a step with its outcome in view.
-        #   blame      : one logit, "the team did worse than predicted at step t" (the sign of dL/dQ_a)
-        #   importance : one logit per agent, "this agent has the largest mixer weight at step t"
+        #   whether : one logit, "the team did worse than predicted at step t" (the sign of dL/dQ_a)
+        #   who     : one logit per agent, "this agent has the largest mixer weight at step t"
         self.n_blame_outputs = getattr(args, "n_blame_outputs", 0)
         if self.n_blame_outputs > 0:
             # built after fc2 from a bookmarked RNG state, then rewound, so that everything built later (the mixer)
             # and every exploration draw are identical to plain QMIX
             rng_state = th.get_rng_state()
-            self.blame = nn.Linear(args.hidden_dim, 1)
-            self.importance = nn.Linear(args.hidden_dim, args.n_agents)
+            self.whether = nn.Linear(args.hidden_dim, 1)
+            self.who = nn.Linear(args.hidden_dim, args.n_agents)
             th.set_rng_state(rng_state)
 
     def init_hidden(self):
@@ -43,6 +43,6 @@ class RNNAgent(nn.Module):
             h = F.relu(self.rnn(x))
         q = self.fc2(h)
         if self.n_blame_outputs > 0:
-            q = th.cat([q, self.blame(h), self.importance(h)], dim=-1)
+            q = th.cat([q, self.whether(h), self.who(h)], dim=-1)
         return q, h
 

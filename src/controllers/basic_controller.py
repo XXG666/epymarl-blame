@@ -30,7 +30,7 @@ class BasicMAC:
         avail_actions = ep_batch["avail_actions"][:, t]
         agent_outs, self.hidden_states = self.agent(agent_inputs, self.hidden_states)
 
-        # --- split [ Q | blame | importance ] so that normalisation touches Q only ---
+        # --- split [ Q | whether | who ] so that normalisation touches Q only ---
         n_blame = getattr(self.args, "n_blame_outputs", 0)
         if n_blame > 0:
             q_outs, b_outs = agent_outs[:, :-n_blame], agent_outs[:, -n_blame:]
