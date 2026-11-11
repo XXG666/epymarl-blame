@@ -104,8 +104,11 @@ def run_sequential(args, logger):
     args.n_agents = env_info["n_agents"]
     args.n_actions = env_info["n_actions"]
     args.state_shape = env_info["state_shape"]
-    # width of the B block: 1 whether logit + one who logit per team member
-    args.n_blame_outputs = args.n_agents + 1 if getattr(args, "blame_head", False) else 0
+    # width of the blame block of an agent's output: 1 whether logit + one who logit per team member
+    if args.blame_head:
+        args.n_blame_outputs = 1 + args.n_agents
+    else:
+        args.n_blame_outputs = 0
 
     # Default/Base scheme
     scheme = {
@@ -192,15 +195,20 @@ def run_sequential(args, logger):
     last_log_T = 0
     model_save_time = 0
     n_test_runs = max(1, args.test_nepisode // runner.batch_size)
-    # the test episodes are also the held-out set for the blame heads: they are collected here, graded by the
-    # learner without any update, and never enter the replay buffer
+    # The test episodes are also the held-out set for the blame heads: they are collected here, graded by
+    # the learner without any update, and never enter the replay buffer.
+    n_test_episodes = n_test_runs * runner.batch_size
+    if args.buffer_cpu_only:
+        held_out_device = "cpu"
+    else:
+        held_out_device = args.device
     held_out = ReplayBuffer(
         scheme,
         groups,
-        n_test_runs * runner.batch_size,
+        n_test_episodes,
         env_info["episode_limit"] + 1,
         preprocess=preprocess,
-        device="cpu" if args.buffer_cpu_only else args.device,
+        device=held_out_device,
     )
 
     start_time = time.time()
@@ -240,10 +248,14 @@ def run_sequential(args, logger):
 
             last_test_T = runner.t_env
             for _ in range(n_test_runs):
-                held_out.insert_episode_batch(runner.run(test_mode=True))
-            if hasattr(learner, "held_out"):  # only the Q learner has blame heads to grade
-                test_batch = held_out[: n_test_runs * runner.batch_size]
-                test_batch = test_batch[:, : test_batch.max_t_filled()]
+                test_episodes = runner.run(test_mode=True)
+                held_out.insert_episode_batch(test_episodes)
+            # only the Q learner has blame heads to grade
+            if hasattr(learner, "held_out"):
+                # the test episodes just collected, truncated to only filled timesteps
+                test_batch = held_out[:n_test_episodes]
+                max_test_t = test_batch.max_t_filled()
+                test_batch = test_batch[:, :max_test_t]
                 if test_batch.device != args.device:
                     test_batch.to(args.device)
                 learner.held_out(test_batch, runner.t_env)

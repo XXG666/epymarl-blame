@@ -20,8 +20,8 @@ class BasicMAC:
         # Only select actions for the selected batch elements in bs
         avail_actions = ep_batch["avail_actions"][:, t_ep]
         agent_outputs = self.forward(ep_batch, t_ep, test_mode=test_mode)
-        # only the Q part takes part in action selection
-        agent_outputs = agent_outputs[..., : self.args.n_actions]
+        # only the Q part takes part in action selection: (batch, agents, n_actions)
+        agent_outputs = agent_outputs[:, :, :self.args.n_actions]
         chosen_actions = self.action_selector.select_action(agent_outputs[bs], avail_actions[bs], t_env, test_mode=test_mode)
         return chosen_actions
 
@@ -31,21 +31,26 @@ class BasicMAC:
         agent_outs, self.hidden_states = self.agent(agent_inputs, self.hidden_states)
 
         # --- split [ Q | whether | who ] so that normalisation touches Q only ---
-        n_blame = getattr(self.args, "n_blame_outputs", 0)
-        if n_blame > 0:
-            q_outs, b_outs = agent_outs[:, :-n_blame], agent_outs[:, -n_blame:]
+        # agent_outs has one row per agent of every episode: (batch * agents, outputs)
+        n_blame_outputs = self.args.n_blame_outputs
+        if n_blame_outputs > 0:
+            q_outs = agent_outs[:, :self.args.n_actions]
+            blame_outs = agent_outs[:, self.args.n_actions:]
         else:
-            q_outs, b_outs = agent_outs, None
+            q_outs = agent_outs
+            blame_outs = None
 
         # Softmax the agent outputs if they're policy logits
         if self.agent_output_type == "pi_logits":
+
             if getattr(self.args, "mask_before_softmax", True):
                 # Make the logits for unavailable actions very negative to minimise their affect on the softmax
                 reshaped_avail_actions = avail_actions.reshape(ep_batch.batch_size * self.n_agents, -1)
                 q_outs = q_outs.masked_fill(reshaped_avail_actions == 0, -1e10)
-            q_outs = th.nn.functional.softmax(q_outs, dim=-1)
-        if b_outs is not None:
-            agent_outs = th.cat([q_outs, b_outs], dim=-1)
+            q_outs = th.nn.functional.softmax(q_outs, dim=1)
+        # put the two parts back together
+        if blame_outs is not None:
+            agent_outs = th.cat([q_outs, blame_outs], dim=1)
         else:
             agent_outs = q_outs
 

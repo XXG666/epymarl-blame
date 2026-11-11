@@ -17,14 +17,15 @@ class RNNAgent(nn.Module):
         self.fc2 = nn.Linear(args.hidden_dim, args.n_actions)  # the Q head, exactly as in plain QMIX
 
         # Output per step: [ Q (n_actions) | whether (1) | who (n_agents) ]
-        # The two blame sub-heads read the hidden state like the Q head; the learner trains their output at step
-        # t+1 on step t, so they judge a step with its outcome in view.
-        #   whether : one logit, "the team did worse than predicted at step t" (the sign of dL/dQ_a)
+        # The two blame sub-heads read the hidden state like the Q head.  The learner trains their output
+        # at step t+1 on step t, so they judge a step with its outcome in view.
+        #   whether : one logit, "the team did clearly worse than predicted at step t"
+        #             (the TD error is above the batch's mean |TD error|)
         #   who     : one logit per agent, "this agent has the largest mixer weight at step t"
-        self.n_blame_outputs = getattr(args, "n_blame_outputs", 0)
+        self.n_blame_outputs = args.n_blame_outputs
         if self.n_blame_outputs > 0:
-            # built after fc2 from a bookmarked RNG state, then rewound, so that everything built later (the mixer)
-            # and every exploration draw are identical to plain QMIX
+            # Built after fc2 from a bookmarked RNG state, which is then restored, so that everything
+            # built later (the mixer) and every exploration draw are identical to plain QMIX.
             rng_state = th.get_rng_state()
             self.whether = nn.Linear(args.hidden_dim, 1)
             self.who = nn.Linear(args.hidden_dim, args.n_agents)
@@ -43,6 +44,9 @@ class RNNAgent(nn.Module):
             h = F.relu(self.rnn(x))
         q = self.fc2(h)
         if self.n_blame_outputs > 0:
-            q = th.cat([q, self.whether(h), self.who(h)], dim=-1)
+            whether_logit = self.whether(h)  # (batch * agents, 1)
+            who_logits = self.who(h)  # (batch * agents, n_agents)
+            # from here on q is the whole output row of an agent: [ Q | whether | who ]
+            q = th.cat([q, whether_logit, who_logits], dim=1)
         return q, h
 

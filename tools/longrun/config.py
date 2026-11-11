@@ -2,21 +2,23 @@
 import pathlib
 
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]  # the repository: tools/longrun/config.py -> ../..
+# The repository folder. This file is tools/longrun/config.py, so the repository is two folders up.
+ROOT = pathlib.Path(__file__).resolve().parents[2]
 
-
+# The environment every job is trained on.
 ENV_KEY = "lbforaging:Foraging-2s-10x10-3p-3f-v3"
 
-
+# Sacred (EPyMARL's logger) gives every training process a numbered folder in here.
 SACRED_DIR = ROOT / "results" / "sacred" / "qmix" / ENV_KEY
 
-
+# One folder per run: its record (run.json), the jobs' logs and their checkpoints.
 RUNS_DIR = ROOT / "results" / "long_runs" / "runs"
 
-
+# One folder per summary of several runs.
 SUMMARIES_DIR = ROOT / "results" / "long_runs" / "summaries"
 
-
+# Settings both jobs share that are not hyperparameters of the algorithm: the environment, the device,
+# how often to log and test, and the checkpoints.
 COMMON_SETTINGS = [
     "env_args.time_limit=50",
     f"env_args.key={ENV_KEY}",
@@ -30,7 +32,7 @@ COMMON_SETTINGS = [
     "save_model_interval=100000",  # checkpoints for resume
 ]
 
-
+# The benchmark's hyperparameters of both jobs: Papoudakis et al. 2021, Table 28 (QMIX, LBF).
 BENCH_SETTINGS = [
     "use_rnn=True",
     "lr=0.0003",
@@ -39,7 +41,7 @@ BENCH_SETTINGS = [
     "evaluation_epsilon=0.05",
 ]
 
-
+# The two jobs of a run, and the settings in which they differ.
 KINDS = {
     "qmix": ["blame_head=False", "split_backward=False"],
     "blame": ["blame_head=True", "split_backward=True"],
