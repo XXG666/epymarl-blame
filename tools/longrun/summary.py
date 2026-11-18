@@ -10,7 +10,8 @@ Words used in this file:
                 was truth and the given answer was answer. Training logs every cell as a metric of its own,
                 named cm_<set><question>_<answerer>_<truth>_<answer>, where <set> is "" for the training
                 batches and "held_out_" for the held-out test episodes.
-    score       {"accuracy": ..., "sensitivity": ..., "specificity": ...} computed from one matrix
+    score       the measures computed from one matrix (see score_of):
+                {"balanced": ..., "sensitivity": ..., "specificity": ...}
     result      everything the table and the plot need to know about one run (see grade_run)
 """
 import json
@@ -45,8 +46,9 @@ ANSWERERS = ["each", "vote"]
 # The answerers as shown in the table and the plot.
 ANSWERER_LABEL = {"each": "each", "vote": "maj"}
 
-# The three numbers of a score.
-MEASURES = ["accuracy", "sensitivity", "specificity"]
+# The numbers of a score. "balanced" is the balanced accuracy, the measure shown for every question: a
+# plain accuracy can be high for a head that always gives the most common answer, a balanced one cannot.
+MEASURES = ["balanced", "sensitivity", "specificity"]
 
 # What comes before the question in the name of a logged count: the set the answers were graded on.
 TRAINING_PREFIX = ""
@@ -66,10 +68,10 @@ T_MAX_WIDTH = 12
 QMIX_WIDTH = 8
 BLAME_WIDTH = 9
 ANSWERER_WIDTH = 18
-QUESTION_WIDTH = {"whether": 20, "who": 12, "combined": 12}
+QUESTION_WIDTH = {"whether": 22, "who": 12, "combined": 12}
 
 # The table: the second heading line of each question's column.
-QUESTION_SUBTITLE = {"whether": "acc    sens/spec", "who": "acc", "combined": "acc"}
+QUESTION_SUBTITLE = {"whether": "bal acc  sens/spec", "who": "bal acc", "combined": "bal acc"}
 
 # The table: the explanation printed below it.
 LEGEND = [
@@ -82,7 +84,8 @@ LEGEND = [
     "                all graded on the held-out test episodes (epsilon 0.05), which nothing is trained on;",
     ("                (train) = graded on the training batches instead, "
      + "because a run in this summary has no held-out data"),
-    "   acc        = accuracy: the share of answers that are right",
+    ("   bal acc    = balanced accuracy: for each possible right answer, the share of its steps where it "
+     + "was given; then the mean over the answers. For whether that is (sensitivity + specificity) / 2"),
     ("   sens/spec  = sensitivity / specificity of the whether answer "
      + "(answer 1, worse than predicted by more than the threshold, is the positive)"),
     "   *  still running (not final)    !  stopped or crashed",
@@ -129,26 +132,17 @@ def late_mean(metrics, name, first_step):
 def empty_score():
     """Out: the score of an answerer with no answers: every measure is missing (nan)."""
     nan = float("nan")
-    return {"accuracy": nan, "sensitivity": nan, "specificity": nan}
+    return {"balanced": nan, "sensitivity": nan, "specificity": nan}
 
 
 def score_of(matrix):
     """In: one confusion matrix; rows = truth, columns = answer. Out: its score.
-    Accuracy is the share of answers on the diagonal, where the answer equals the truth.
-    Sensitivity and specificity are for a yes/no question (a 2 x 2 matrix), with answer 1 as the positive;
-    they are nan for the other questions."""
+    Balanced is the balanced accuracy: the mean of the recalls. There is one recall per true answer: of
+    the cases with this true answer, the share where the given answer was right. A true answer without
+    cases has no recall and is left out of the mean.
+    Sensitivity and specificity are for a yes/no question (a 2 x 2 matrix), with answer 1 as the positive:
+    they are the recalls of the true answers 1 and 0. They are nan for the other questions."""
     score = empty_score()
-    total = 0
-    for row in matrix:
-        total = total + sum(row)
-    if total == 0:
-        return score
-
-    right = 0
-    for position in range(len(matrix)):
-        right = right + matrix[position][position]
-    score["accuracy"] = right / total
-
     if len(matrix) == 2:
         truly_yes = sum(matrix[1])  # row 1: every case whose true answer is 1
         truly_no = sum(matrix[0])  # row 0: every case whose true answer is 0
@@ -156,6 +150,14 @@ def score_of(matrix):
             score["sensitivity"] = matrix[1][1] / truly_yes
         if truly_no != 0:
             score["specificity"] = matrix[0][0] / truly_no
+
+    recalls = []
+    for truth in range(len(matrix)):
+        cases = sum(matrix[truth])  # row truth: every case whose true answer is truth
+        if cases != 0:
+            recalls.append(matrix[truth][truth] / cases)
+    # mean gives nan for an empty list: a matrix without any case has no balanced accuracy
+    score["balanced"] = mean(recalls)
     return score
 
 
@@ -240,7 +242,7 @@ def grade_question(metrics, question, answerer, set_prefix, first_late_step):
     """In: the blame job's metrics, a question, an answerer, the prefix of the set to grade on, and the
     step at which the second half of the job begins.
     Out: (score, curve). score: from the counts of all log points in the second half, added up.
-    curve: a series {"steps": [...], "values": [...]} with the accuracy at every log point."""
+    curve: a series {"steps": [...], "values": [...]} with the balanced accuracy at every log point."""
     steps, matrices = confusion_counts(metrics, question, answerer, set_prefix)
 
     late_matrices = []
@@ -255,10 +257,10 @@ def grade_question(metrics, question, answerer, set_prefix, first_late_step):
     else:
         score = score_of(add_matrices(late_matrices))
 
-    accuracies = []
+    values = []
     for matrix in matrices:
-        accuracies.append(score_of(matrix)["accuracy"])
-    curve = {"steps": steps, "values": accuracies}
+        values.append(score_of(matrix)["balanced"])
+    curve = {"steps": steps, "values": values}
     return score, curve
 
 
@@ -293,7 +295,8 @@ def grade_run(rec, alive, held_out):
                             episodes, when the run has them and held_out is True), else "training" (its
                             training batches); None while the job has logged no counts at all
         "scores"            scores[question][answerer] = the score pooled over the second half of the steps
-        "curves"            curves[question][answerer] = a series with the accuracy at every log point"""
+        "curves"            curves[question][answerer] = a series with the balanced accuracy at every log
+                            point"""
     result = {"rec": rec}
     statuses = []
     for kind in KINDS:
@@ -364,17 +367,17 @@ def header_lines(id_width):
 
 
 def score_cell(question, score):
-    """In: a question and a score. Out: the score as text for the table: the accuracy for every question,
-    and sensitivity/specificity as well for whether, the yes/no question."""
-    accuracy = score["accuracy"]
-    accuracy_text = f"{accuracy:.3f}"
+    """In: a question and a score. Out: the score as text for the table: the balanced accuracy for every
+    question, and sensitivity/specificity as well for whether, the yes/no question."""
+    balanced = score["balanced"]
+    balanced_text = f"{balanced:.3f}"
     if question == "whether":
-        # "0.812  " + "0.640/0.910" + "  " is 7 + 11 + 2 = 20 characters: QUESTION_WIDTH["whether"].
-        # The cell is not filled up to 20: a missing value prints as the shorter "nan".
+        # "0.512    " + "0.640/0.910" + "  " is 9 + 11 + 2 = 22 characters: QUESTION_WIDTH["whether"].
+        # The cell is not filled up to 22: a missing value prints as the shorter "nan".
         sensitivity = score["sensitivity"]
         specificity = score["specificity"]
-        return accuracy_text.ljust(7) + f"{sensitivity:.3f}/{specificity:.3f}" + "  "
-    return accuracy_text.ljust(QUESTION_WIDTH[question])
+        return balanced_text.ljust(9) + f"{sensitivity:.3f}/{specificity:.3f}" + "  "
+    return balanced_text.ljust(QUESTION_WIDTH[question])
 
 
 def score_lines(left, id_width, scores, note):
@@ -537,9 +540,9 @@ def draw_returns(panel, results):
     panel.set_title("test return")
 
 
-def draw_accuracies(panel, results, question, answerer):
+def draw_balanced_accuracy(panel, results, question, answerer):
     """In: a panel, the runs' results, and the panel's question and answerer.
-    Draws the accuracy of the agents' answers and the panel's title."""
+    Draws the balanced accuracy of the agents' answers and the panel's title."""
     series_list = []
     for result in results:
         series_list.append(result["curves"][question][answerer])
@@ -548,7 +551,7 @@ def draw_accuracies(panel, results, question, answerer):
 
     question_title = QUESTION_TITLE[question]
     answerer_label = ANSWERER_LABEL[answerer]
-    panel.set_title(f"{question_title} accuracy: {answerer_label}")
+    panel.set_title(f"{question_title} balanced accuracy: {answerer_label}")
 
 
 def panel_layout():
@@ -565,12 +568,12 @@ def panel_layout():
 
 def plot(results, path, title, graded):
     """Left: test return of both jobs. Right: a panel per question (columns) and answerer (rows) with the
-    agents' accuracy on the graded episodes.
+    balanced accuracy of the agents' answers on the graded episodes.
     Lines are the mean over the runs, bands their min-max range.
     In: the runs' results, the path of the picture to write, the title, and the set the heads are graded on
     ("held-out" or "training")."""
     layout = panel_layout()
-    # the return panel is twice as wide as the accuracy panel of a question
+    # the return panel is twice as wide as the panel of a question
     width_ratios = [2]
     for question in QUESTIONS:
         width_ratios.append(1)
@@ -580,7 +583,7 @@ def plot(results, path, title, graded):
     for question in QUESTIONS:
         for answerer in ANSWERERS:
             panel = panels[panel_name(question, answerer)]
-            draw_accuracies(panel, results, question, answerer)
+            draw_balanced_accuracy(panel, results, question, answerer)
     # the panels share the step axis: this starts all of them at step 0
     panels["return"].set_xlim(left=0)
 
