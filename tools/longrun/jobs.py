@@ -1,20 +1,19 @@
 """Run records on disk, the jobs' processes and state, launching, and reading a job's logged metrics.
 
-A run trains two jobs, one per entry of KINDS ("qmix" and "blame"). Each start of a job is an attempt:
-the first attempt starts at step 0, an attempt made by resume starts at a checkpoint.
+A run trains two jobs, one per entry of KINDS ("qmix" and "blame"). Each job is started once, at step 0.
 
 A run's record (rec in the code) is the dictionary stored in results/long_runs/runs/<id>/run.json:
     id, seed, t_max, note, created    what was asked for, and when
     commit, src, dirty                the code the run started with (see git_state)
-    attempts                          {"qmix": [...], "blame": [...]} with one entry per attempt:
-                                      {"n": attempt number, "start_t": step it started at,
-                                       "commit": the commit then, "command": its command line}
+    attempts                          {"qmix": [...], "blame": [...]}: an empty list until the job is started,
+                                      then one entry,
+                                      {"n": 1, "start_t": 0, "commit": the commit then,
+                                       "command": its command line}
 """
 import json
 import os
 import pathlib
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -36,10 +35,9 @@ def label(run_id, kind):
     return f"longrun.{run_id}.{kind}"
 
 
-def attempt_log(run_id, kind, n):
-    """In: a run's ID, the job's kind and an attempt number n (1, 2, ...). Out: the path of the file that
-    holds everything this attempt printed."""
-    return run_dir(run_id) / f"{kind}.{n}.log"
+def job_log(run_id, kind):
+    """In: a run's ID and the job's kind. Out: the path of the file that holds everything the job printed."""
+    return run_dir(run_id) / f"{kind}.1.log"
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -89,7 +87,7 @@ def read_json(path, tries=5):
 
 
 def read_log(path):
-    """In: the path of an attempt's log. Out: its text, or "" if the file does not exist."""
+    """In: the path of a job's log. Out: its text, or "" if the file does not exist."""
     if not path.exists():
         return ""
     return path.read_text(errors="ignore")
@@ -128,8 +126,8 @@ def commit_text(rec):
 # ---------------------------------------------------------------------------------------------------------
 
 def live_jobs():
-    """{label: pid} of every job of this tool that is running right now."""
-    alive = {}
+    """Out: the list of the labels of every job of this tool that is running right now."""
+    alive = []
     # /proc has one folder per running process, named by the process's ID
     for process_dir in pathlib.Path("/proc").iterdir():
         try:
@@ -148,21 +146,19 @@ def live_jobs():
         if job_label is None:
             continue
         if "src/main.py" in command_words and pathlib.Path(working_dir) == ROOT:
-            alive[job_label] = int(process_dir.name)
+            alive.append(job_label)
     return alive
 
 
 def job_state(rec, kind, alive):
     """(status, steps reached); status is running / done / stopped / crashed / not started.
     In: a run's record, the job's kind and the result of live_jobs()."""
-    attempts = rec["attempts"][kind]
-    if len(attempts) == 0:
+    if len(rec["attempts"][kind]) == 0:
         return "not started", 0
-    last_attempt = attempts[-1]
-    log_text = read_log(attempt_log(rec["id"], kind, last_attempt["n"]))
+    log_text = read_log(job_log(rec["id"], kind))
 
     # the log names the step again and again (t_env: 12345): the largest one is how far the job got
-    steps_reached = last_attempt["start_t"]
+    steps_reached = 0
     for digits in re.findall(r"t_env:\s*(\d+)", log_text):
         steps_reached = max(steps_reached, int(digits))
 
@@ -173,40 +169,6 @@ def job_state(rec, kind, alive):
     if "Traceback" in log_text:
         return "crashed", steps_reached
     return "stopped", steps_reached
-
-
-def counted_attempts(rec, kind):
-    """The attempts whose results count: the latest one that started at step 0 and every one after it.
-    In: a run's record and the job's kind. Out: a list of attempt entries, oldest first."""
-    attempts = rec["attempts"][kind]
-    first_counted = 0
-    for position in range(len(attempts)):
-        if attempts[position]["start_t"] == 0:
-            first_counted = position
-    return attempts[first_counted:]
-
-
-def latest_checkpoint(run_id, kind):
-    """(checkpoint directory, step) of the job's newest complete checkpoint, or None."""
-    models_dir = run_dir(run_id) / kind / "models"
-    best_dir = None
-    best_step = None
-    # a checkpoint is a folder models/<name of the training process>/<step>/ with three files in it
-    for agent_file in models_dir.glob("*/*/agent.th"):
-        step_dir = agent_file.parent
-        if not step_dir.name.isdigit():
-            continue
-        if not (step_dir / "mixer.th").exists():
-            continue
-        if not (step_dir / "opt.th").exists():
-            continue
-        step = int(step_dir.name)
-        if best_dir is None or step > best_step:
-            best_dir = step_dir
-            best_step = step
-    if best_dir is None:
-        return None
-    return best_dir, best_step
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -229,80 +191,44 @@ def training_command(rec, kind, job_dir):
     return command
 
 
-def launch(rec, kind, resume_from=None):
-    """Start one attempt of a job in the background. resume_from: (checkpoint dir, step) or None for step 0.
-    In: a run's record and the job's kind. Out: the step the attempt starts at. The attempt is added to the
-    record, and the record is saved."""
-    attempts = rec["attempts"][kind]
-    attempt_number = len(attempts) + 1
+def launch(rec, kind):
+    """Start a job in the background, at step 0.
+    In: a run's record and the job's kind. The job's entry is added to the record, and the record is
+    saved."""
     job_dir = run_dir(rec["id"]) / kind
     job_dir.mkdir(parents=True, exist_ok=True)
     command = training_command(rec, kind, job_dir)
 
-    start_t = 0
-    if resume_from is not None:
-        checkpoint_dir, start_t = resume_from
-        # checkpoint folder names contain spaces and colons: copy the step to a plain path first
-        resume_dir = job_dir / "resume_from"
-        shutil.rmtree(resume_dir, ignore_errors=True)
-        shutil.copytree(checkpoint_dir, resume_dir / str(start_t))
-        resume_path = resume_dir.relative_to(ROOT)
-        command.append(f"checkpoint_path={resume_path}")
-        command.append(f"load_step={start_t}")
-
-    # everything the job prints goes to the attempt's log; with a session of its own the job keeps going
+    # everything the job prints goes to the job's log; with a session of its own the job keeps going
     # after the terminal closes
-    log_file = open(attempt_log(rec["id"], kind, attempt_number), "w")
+    log_file = open(job_log(rec["id"], kind), "w")
     subprocess.Popen(command, cwd=ROOT, stdout=log_file, stderr=subprocess.STDOUT,
                      stdin=subprocess.DEVNULL, start_new_session=True)
 
     commit, src_hash, dirty = git_state()
     # the first word is the full path of this Python: the record keeps the short "python" instead
     command_text = "python " + " ".join(command[1:])
-    attempts.append({"n": attempt_number, "start_t": start_t, "commit": commit, "command": command_text})
+    rec["attempts"][kind].append({"n": 1, "start_t": 0, "commit": commit, "command": command_text})
     save_run(rec)
-    return start_t
 
 
 # ---------------------------------------------------------------------------------------------------------
 # A job's logged metrics
 # ---------------------------------------------------------------------------------------------------------
 
-def attempt_metrics(run_id, kind, n):
-    """In: a run's ID, the job's kind and an attempt number. Out: everything Sacred logged for this attempt,
-    {metric name: {"steps": [...], "values": [...]}}, or None if there is nothing to read."""
-    log_text = read_log(attempt_log(run_id, kind, n))
+def job_metrics(rec, kind):
+    """In: a run's record and the job's kind. Out: everything Sacred logged for this job,
+    {metric name: {"steps": [...], "values": [...]}}; an empty dictionary if there is nothing to read."""
+    log_text = read_log(job_log(rec["id"], kind))
     # the log names the numbered folder Sacred gave this training process
     sacred_ids = re.findall(r'Started run with ID "(\d+)"', log_text)
     if len(sacred_ids) == 0:
-        return None
-    return read_json(SACRED_DIR / sacred_ids[-1] / "metrics.json")
-
-
-def job_metrics(rec, kind):
-    """The job's logged metrics, stitched over its counted attempts: each attempt contributes its values
-    from its own start step up to the step the next attempt resumed from.
-    In: a run's record and the job's kind. Out: {metric name: {"steps": [...], "values": [...]}}."""
-    attempts = counted_attempts(rec, kind)
-    merged = {}
-    for position in range(len(attempts)):
-        attempt = attempts[position]
-        metrics = attempt_metrics(rec["id"], kind, attempt["n"])
-        if not metrics:
-            continue  # nothing to read, or nothing logged yet
-
-        # this attempt counts from its own start step up to (not including) the next attempt's start step
-        first_step = attempt["start_t"]
-        if position + 1 < len(attempts):
-            end_step = attempts[position + 1]["start_t"]
-        else:
-            end_step = float("inf")
-
-        for name, series in metrics.items():
-            if name not in merged:
-                merged[name] = {"steps": [], "values": []}
-            for step, value in zip(series["steps"], series["values"]):
-                if step >= first_step and step < end_step:
-                    merged[name]["steps"].append(step)
-                    merged[name]["values"].append(value)
-    return merged
+        return {}
+    logged = read_json(SACRED_DIR / sacred_ids[-1] / "metrics.json")
+    if not logged:
+        return {}  # no readable file, or nothing logged yet
+    # Sacred stores the time of every value as well: keep the steps and the values only
+    metrics = {}
+    for name in logged:
+        metrics[name] = {"steps": logged[name]["steps"], "values": logged[name]["values"]}
+    return metrics

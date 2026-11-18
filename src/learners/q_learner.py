@@ -1,7 +1,5 @@
 import copy
-import os
 
-import numpy as np
 import torch as th
 from torch.optim import Adam
 import torch.nn.functional as F
@@ -51,31 +49,6 @@ class QLearner:
             rew_shape = (1,) if self.args.common_reward else (self.n_agents,)
             self.rew_ms = RunningMeanStd(shape=rew_shape, device=device)
 
-        # The baseline, an upper limit for the agents' two sub-heads: one centralised head that answers
-        # the same two questions from what no single agent has, the global state before and after the
-        # step and every agent's hidden state.  It learns the same labels with its own optimiser and is
-        # connected to nothing else, so the agents and the mixer train exactly as without it.
-        # It is built from a bookmarked RNG state, like the sub-heads: the state is saved before the head
-        # draws its initial weights and restored afterwards.
-        self.central = None
-        if args.n_blame_outputs > 0:
-            rng_state = th.get_rng_state()
-            state_size = int(np.prod(args.state_shape))
-            all_hidden_size = args.n_agents * args.hidden_dim
-            central_input_size = 2 * state_size + all_hidden_size
-            self.central = th.nn.Sequential(
-                th.nn.Linear(central_input_size, 128),
-                th.nn.ReLU(),
-                th.nn.Linear(128, args.n_blame_outputs),
-            )
-            self.central_optimiser = Adam(self.central.parameters(), lr=args.lr)
-            th.set_rng_state(rng_state)
-
-        # The naive method, a lower limit: it knows nothing and guesses, with its own random generator so
-        # that the random numbers of training are untouched.
-        self.naive_rng = th.Generator()
-        self.naive_rng.manual_seed(args.seed)
-
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
         # Get the relevant quantities
         rewards = batch["reward"][:, :-1]
@@ -98,12 +71,10 @@ class QLearner:
 
         # Calculate estimated Q-Values
         mac_out = []
-        hidden = []  # every agent's hidden state after each step, read by the centralised head
         self.mac.init_hidden(batch.batch_size)
         for t in range(batch.max_seq_length):
             agent_outs = self.mac.forward(batch, t=t)
             mac_out.append(agent_outs)
-            hidden.append(self.mac.hidden_states)
         mac_out = th.stack(mac_out, dim=1)  # Concat over time
 
         # --- split the combined [ Q | whether | who ] output ---
@@ -186,7 +157,7 @@ class QLearner:
 
         # Normal L2 loss, take mean over actual data
         loss = (masked_td_error**2).sum() / mask.sum()
-
+        # dL/dQ_tot  =  TD error × 2 / N 
         # Optimise
         self.optimiser.zero_grad()
         if q_agents_cut is not None:
@@ -226,16 +197,11 @@ class QLearner:
                 whether_loss = self._whether_loss(whether_logit, whether_target, real)
                 who_loss = self._who_loss(who_logits, who_target, defined)
 
-                # --- the two reference points: the centralised head learns, the naive method only logs ---
-                central_in = self._central_input(batch, hidden)
-                central_out = self._central_train(central_in, whether_target, who_target, real, defined)
                 if t_env - self.log_stats_t >= self.args.learner_log_interval:
                     self.logger.log_stat("whether_loss", whether_loss.item(), t_env)
                     self.logger.log_stat("who_loss", who_loss.item(), t_env)
                     # prefix="" marks the counts of training batches (held_out uses "held_out_")
-                    self._log_all_answerers(
-                        blame_out, central_out, whether_target, who_target, real, defined, t_env, prefix=""
-                    )
+                    self._log_agents(blame_out, whether_target, who_target, real, defined, t_env, prefix="")
 
                 # resume: autograd adds the TD gradient (full_grad) and the two losses' gradient, one pass
                 blame_loss = whether_loss + who_loss
@@ -282,29 +248,32 @@ class QLearner:
             self.log_stats_t = t_env
 
     # ------------------------------------------------------------------------------------------------
-    # Two sub-heads trained on the interrupted signal: whether on the TD error delta, who on the
-    # gradient dL/dQ_a = (2/|T|) * delta * dQ_tot/dQ_a.
+    # Two sub-heads trained on the interrupted signal.  With delta = Q_tot - target, the TD error, and
+    # |T|, the number of real steps in the batch:
+    #     dL/dQ_tot = (2/|T|) * delta                    one value per step, the same for every agent
+    #     dL/dQ_a   = dL/dQ_tot * dQ_tot/dQ_a            one value per step and agent
+    # dQ_tot/dQ_a is the mixer weight of agent a, which is never negative.
+    # whether is trained on dL/dQ_tot, who on dL/dQ_a.
     # Every agent judges the same step from its own view, so all agents share each target, which has
     # one entry per step: (batch, steps).
     # ------------------------------------------------------------------------------------------------
     def _whether_target(self, delta, mask):
-        """whether: did the team do clearly worse than predicted at this step?
+        """whether: did the team do worse than predicted at this step, by more than a fixed threshold?
 
         delta: the TD error Q_tot - target, (batch, steps).  It is positive when the step went worse than
         predicted.  mask: (batch, steps, agents), larger than 0 on the real (not padded) steps and the
         same for every agent.
 
-        A step is blamable when delta is above the mean of |delta| over the batch's real steps, that is,
-        when the miss is larger than the typical error in this batch.
+        A step is blamable when dL/dQ_tot = (2/|T|) * delta is positive and larger than a fixed threshold,
+        the setting whether_threshold.  |T| is the number of real steps in the batch, so the same delta
+        gives a smaller dL/dQ_tot in a batch with more real steps.
 
         Returns (real, target).  real: (batch, steps), True on the steps that count, the real steps.
         target: (batch, steps), 1.0 if the step is blamable, else 0.0."""
         real = (mask[:, :, 0] > 0)  # (batch, steps)
-        # Indexing with the (batch, steps) True/False tensor keeps only the real steps and lines them up
-        # along one dimension: (batch, steps) becomes (real steps,).
-        real_delta = delta[real]  # (real steps,)
-        typical_error = real_delta.abs().mean()
-        target = (delta > typical_error).float()
+        n_real_steps = real.sum()  # |T|
+        dL_dQtot = 2 * delta / n_real_steps  # (batch, steps)
+        target = (dL_dQtot > self.args.whether_threshold).float()
         return real, target
 
     def _who_target(self, dL_dQa, mask):
@@ -327,20 +296,27 @@ class QLearner:
         """Binary cross-entropy between every agent's whether logit and the shared 0/1 target.
 
         logit: (batch, steps, agents).  target: (batch, steps).  counted: (batch, steps), True on the
-        steps that count.  Returns one number, the mean over the counted steps and the agents."""
+        steps that count.  Returns one number, the mean over the counted steps and the agents.
+
+        The loss of the steps whose target is 1 is multiplied by the setting whether_pos_weight.  Above
+        1.0 a missed 1 costs more than a wrongly given 1, so the head says 1 more often; 1.0 weighs both
+        kinds of steps the same."""
         # every agent has the same target: repeat it once per agent
         target_per_agent = target.unsqueeze(2).expand_as(logit)  # (batch, steps, agents)
         # Indexing with the (batch, steps) True/False tensor keeps only the counted steps and lines them
         # up along one dimension: (batch, steps, agents) becomes (counted steps, agents).
         counted_logit = logit[counted]  # (counted steps, agents)
         counted_target = target_per_agent[counted]  # (counted steps, agents)
-        return F.binary_cross_entropy_with_logits(counted_logit, counted_target)
+        # binary_cross_entropy_with_logits wants the weight as a tensor
+        pos_weight = th.tensor(self.args.whether_pos_weight, device=counted_logit.device)
+        return F.binary_cross_entropy_with_logits(counted_logit, counted_target, pos_weight=pos_weight)
 
     def _who_loss(self, logits, target, counted):
-        """Cross-entropy between every agent's who logits and the shared target index.
+        """Cross-entropy between every agent's who logits and the shared target.
 
-        logits: (batch, steps, agents, n_agents).  target: (batch, steps).  counted: (batch, steps), True
-        on the steps that count.  Returns one number, the mean over the counted steps and the agents."""
+        logits: (batch, steps, agents, n_agents).  target: (batch, steps), the index of the right agent.
+        counted: (batch, steps), True on the steps that count.
+        Returns one number, the mean over the counted steps and the agents."""
         n_answerers = logits.size(2)
         n_choices = logits.size(3)
         # every agent has the same target: repeat it once per agent (-1 keeps a dimension as it is)
@@ -352,7 +328,10 @@ class QLearner:
         # -1 lets PyTorch work out the number of rows.
         logit_rows = counted_logits.reshape(-1, n_choices)  # (counted steps * agents, n_agents)
         target_rows = counted_target.reshape(-1)  # (counted steps * agents,)
-        return F.cross_entropy(logit_rows, target_rows)
+        # Write every target as a vector: 1.0 at the right agent and 0.0 at the others.
+        # With 3 agents the index 2 becomes (0, 0, 1).
+        target_vectors = F.one_hot(target_rows, n_choices).float()  # (counted steps * agents, n_agents)
+        return F.cross_entropy(logit_rows, target_vectors)
 
     # ------------------------------------------------------------------------------------------------
     # Held-out grading: the same labels and counts on the runner's test episodes, which never enter the
@@ -378,19 +357,14 @@ class QLearner:
             return
 
         with th.no_grad():
-            mac_out, hidden = self._rollout(self.mac, batch)
+            mac_out = self._rollout(self.mac, batch)
         delta, dL_dQa, mask = self._credit(batch, mac_out)
         real, whether_target = self._whether_target(delta, mask)
         defined, who_target = self._who_target(dL_dQa, mask)
 
         # the sub-heads judge step t at step t+1, as in train
         blame_out = mac_out[:, 1:, :, self.args.n_actions:]  # (batch, steps, agents, [ whether | who ])
-        with th.no_grad():
-            central_in = self._central_input(batch, hidden)
-            central_out = self.central(central_in)
-        self._log_all_answerers(
-            blame_out, central_out, whether_target, who_target, real, defined, t_env, prefix="held_out_"
-        )
+        self._log_agents(blame_out, whether_target, who_target, real, defined, t_env, prefix="held_out_")
 
     def _credit(self, batch, mac_out):
         """The TD error and dL/dQ_a of a batch with the current networks, for labels only: the same
@@ -422,8 +396,7 @@ class QLearner:
             q_out = mac_out[:, :, :, :n_actions]  # (batch, steps + 1, agents, n_actions)
             q_agents = th.gather(q_out[:, :-1], dim=3, index=actions).squeeze(3)  # (batch, steps, agents)
 
-            # the target agents' hidden states are not needed
-            target_mac_out, target_hidden = self._rollout(self.target_mac, batch)
+            target_mac_out = self._rollout(self.target_mac, batch)
             target_q_out = target_mac_out[:, 1:, :, :n_actions]  # (batch, steps, agents, n_actions)
             # unavailable actions get a very low value, so the max below never picks them
             target_q_out[avail_actions[:, 1:] == 0] = -9999999
@@ -457,91 +430,26 @@ class QLearner:
 
         mac: the controller (the live one or the target one).  batch: the episodes.
 
-        Returns (outputs, hidden).  outputs: every agent's output at every step,
-        (batch, steps + 1, agents, outputs).  hidden: a list with steps + 1 entries, the agents' hidden
-        states after each forward pass, each (batch * agents, hidden size)."""
+        Returns every agent's output at every step, (batch, steps + 1, agents, outputs)."""
         outputs = []
-        hidden = []
         mac.init_hidden(batch.batch_size)
         for t in range(batch.max_seq_length):
             outputs.append(mac.forward(batch, t=t))
-            hidden.append(mac.hidden_states)
-        return th.stack(outputs, dim=1), hidden
-
-    # ------------------------------------------------------------------------------------------------
-    # The two reference points for the agents' sub-heads, on the same labels and the same two questions.
-    # The baseline, an upper limit: a centralised head that reads the global state and all agents' hidden
-    # states, logged as the answerer "central".  The naive method, a lower limit: random guesses, logged
-    # as "naive".
-    # ------------------------------------------------------------------------------------------------
-    def _central_input(self, batch, hidden):
-        """What the centralised head reads for every step t: the global state at t and at t+1, and every
-        agent's hidden state at t+1, the moment the agents' own heads answer.
-
-        batch: the episodes.  hidden: the list from _rollout or train, steps + 1 entries of
-        (batch * agents, hidden size).
-        Returns (batch, steps, 2 * state size + agents * hidden size), without a graph."""
-        # hidden[0] is the state after the first forward pass (t = 0).  For step t the head reads the
-        # state after the pass at t+1, so the first entry is left out and steps entries remain.
-        hidden_per_step = []
-        for hidden_state in hidden[1:]:
-            # The rows of one episode's agents follow each other, so this puts all agents' hidden states
-            # of an episode side by side: (batch * agents, hidden size) -> (batch, agents * hidden size).
-            hidden_per_step.append(hidden_state.reshape(batch.batch_size, -1))
-        hidden_after = th.stack(hidden_per_step, dim=1).detach()  # (batch, steps, agents * hidden size)
-        state_before = batch["state"][:, :-1]  # (batch, steps, state size)
-        state_after = batch["state"][:, 1:]  # (batch, steps, state size)
-        return th.cat([state_before, state_after, hidden_after], dim=2)
-
-    def _central_train(self, central_in, whether_target, who_target, real, defined):
-        """One update of the centralised head on the batch's labels, with its own optimiser.
-
-        central_in: (batch, steps, inputs), from _central_input.  whether_target, who_target, real,
-        defined: (batch, steps), from _whether_target and _who_target.
-
-        Returns the head's outputs from before the update, without a graph:
-        (batch, steps, [ whether logit | who logits ])."""
-        central_out = self.central(central_in)
-        whether_logit = central_out[:, :, 0]  # (batch, steps)
-        who_logits = central_out[:, :, 1:]  # (batch, steps, n_agents)
-        # keep the counted steps only, as in _whether_loss: (batch, steps) becomes (counted steps,)
-        real_whether_logit = whether_logit[real]  # (real steps,)
-        real_whether_target = whether_target[real]  # (real steps,)
-        defined_who_logits = who_logits[defined]  # (defined steps, n_agents)
-        defined_who_target = who_target[defined]  # (defined steps,)
-        whether_loss = F.binary_cross_entropy_with_logits(real_whether_logit, real_whether_target)
-        who_loss = F.cross_entropy(defined_who_logits, defined_who_target)
-        loss = whether_loss + who_loss
-        self.central_optimiser.zero_grad()
-        loss.backward()
-        self.central_optimiser.step()
-        return central_out.detach()
+        return th.stack(outputs, dim=1)
 
     # ------------------------------------------------------------------------------------------------
     # Logging: confusion counts of the three questions, whether, who and combined.
     # prefix = "" for training batches, "held_out_" for the test episodes.  The metric names are
-    # cm_<prefix><whether|who|combined>_<each|vote|central|naive>_<truth>_<answer>.
+    # cm_<prefix><whether|who|combined>_<each|vote>_<truth>_<answer>.
     # ------------------------------------------------------------------------------------------------
-    def _log_all_answerers(
-        self, blame_out, central_out, whether_target, who_target, real, defined, t_env, prefix
-    ):
-        """Log the counts of everyone who answers: the agents, the centralised head and the naive method.
-
-        blame_out: the agents' sub-head outputs, (batch, steps, agents, [ whether logit | who logits ]).
-        central_out: the centralised head's outputs, (batch, steps, [ whether logit | who logits ]).
-        whether_target, who_target, real, defined: (batch, steps), from _whether_target and _who_target.
-        t_env: the environment step to log at.  prefix: "" or "held_out_", put in front of the question
-        in the metric names."""
-        self._log_agents(blame_out, whether_target, who_target, real, defined, t_env, prefix)
-        self._log_central(central_out, whether_target, who_target, real, defined, t_env, prefix)
-        self._log_naive(whether_target, who_target, real, defined, t_env, prefix)
-
     def _log_agents(self, blame_out, whether_target, who_target, real, defined, t_env, prefix):
         """The agents' answers to the three questions.  Turns the logits into probabilities and counts each
         question's answers, per agent ("each") and as a team vote ("vote").
 
-        blame_out: (batch, steps, agents, [ whether logit | who logits ]).  The other arguments are as in
-        _log_all_answerers."""
+        blame_out: the agents' sub-head outputs, (batch, steps, agents, [ whether logit | who logits ]).
+        whether_target, who_target, real, defined: (batch, steps), from _whether_target and _who_target.
+        t_env: the environment step to log at.  prefix: "" or "held_out_", put in front of the question
+        in the metric names."""
         with th.no_grad():
             p_whether = th.sigmoid(blame_out[:, :, :, 0])  # (batch, steps, agents)
             p_who = th.softmax(blame_out[:, :, :, 1:], dim=3)  # (batch, steps, agents, n_agents)
@@ -554,7 +462,7 @@ class QLearner:
 
         p_whether: (batch, steps, agents), P(the step is blamable, see _whether_target).
         target: (batch, steps), 1.0 or 0.0.  counted: (batch, steps), True on the steps that count.
-        t_env, prefix: as in _log_all_answerers."""
+        t_env, prefix: as in _log_agents."""
         truth = target.long()
         answer = (p_whether > 0.5).long()
         # the probability of each of the two answers, 0 (no) and 1 (yes)
@@ -566,7 +474,7 @@ class QLearner:
 
         p_who: (batch, steps, agents, n_agents), P(each agent is the most important).
         target: (batch, steps), an agent index.  counted: (batch, steps), True on the steps that count.
-        t_env, prefix: as in _log_all_answerers."""
+        t_env, prefix: as in _log_agents."""
         answer = p_who.argmax(dim=3)  # (batch, steps, agents)
         self._log_each_and_vote(prefix + "who", target, answer, p_who, counted, t_env)
 
@@ -576,7 +484,7 @@ class QLearner:
 
         p_whether: (batch, steps, agents).  p_who: (batch, steps, agents, n_agents).
         whether_target, who_target: (batch, steps).  counted: (batch, steps), True on the steps that
-        count.  t_env, prefix: as in _log_all_answerers."""
+        count.  t_env, prefix: as in _log_agents."""
         n_agents = p_who.size(3)
         nobody = n_agents  # the extra answer "nobody" gets the index after the last agent
         says_yes = (p_whether > 0.5)  # (batch, steps, agents)
@@ -627,68 +535,13 @@ class QLearner:
         score = th.where(tied, summed_probs, -1.0)
         return score.argmax(dim=2)
 
-    def _log_central(self, central_out, whether_target, who_target, real, defined, t_env, prefix):
-        """The centralised head's answers, by the agents' rules: yes to whether if P > 0.5 (a logit above
-        0), and for who the most likely agent.
-
-        central_out: (batch, steps, [ whether logit | who logits ]).  The other arguments are as in
-        _log_all_answerers."""
-        says_yes = (central_out[:, :, 0] > 0)  # (batch, steps)
-        named_agent = central_out[:, :, 1:].argmax(dim=2)  # (batch, steps)
-        self._log_one_answer_per_step(
-            "central", says_yes, named_agent, whether_target, who_target, real, defined, t_env, prefix
-        )
-
-    def _log_naive(self, whether_target, who_target, real, defined, t_env, prefix):
-        """The naive method's answers: yes or no to whether with probability 1/2 each, and for who an agent
-        drawn with equal probability, at every step.  The arguments are as in _log_all_answerers."""
-        shape = whether_target.shape  # (batch, steps)
-        device = whether_target.device
-        coin = th.randint(0, 2, shape, generator=self.naive_rng).to(device)
-        says_yes = (coin == 1)  # (batch, steps)
-        named_agent = th.randint(0, self.n_agents, shape, generator=self.naive_rng).to(device)
-        self._log_one_answer_per_step(
-            "naive", says_yes, named_agent, whether_target, who_target, real, defined, t_env, prefix
-        )
-
-    def _log_one_answer_per_step(
-        self, answerer, says_yes, named_agent, whether_target, who_target, real, defined, t_env, prefix
-    ):
-        """Confusion counts of an answerer that gives one answer per step.
-
-        answerer: "central" or "naive", the name the counts are logged under.  says_yes: (batch, steps),
-        True if it says the step is blamable.  named_agent: (batch, steps), the agent it names.  The
-        other arguments are as in _log_all_answerers.
-
-        Its combined answer is the named agent if it says yes, else nobody, as for the agents."""
-        n_agents = self.n_agents
-        nobody = n_agents  # the extra answer "nobody" gets the index after the last agent
-        # Indexing with real or defined keeps the counted steps only: (batch, steps) -> (counted steps,).
-
-        # whether has 2 possible answers: 0 (no) and 1 (yes)
-        whether_truth = whether_target.long()
-        whether_answer = says_yes.long()
-        self._log_confusion_matrix(
-            prefix + "whether", answerer, whether_truth[real], whether_answer[real], 2, t_env
-        )
-        # who has n_agents possible answers
-        self._log_confusion_matrix(
-            prefix + "who", answerer, who_target[defined], named_agent[defined], n_agents, t_env
-        )
-        # combined has n_agents + 1 possible answers: the agents and nobody
-        combined_truth = th.where(whether_target == 1, who_target, nobody)  # (batch, steps)
-        combined_answer = th.where(says_yes, named_agent, nobody)  # (batch, steps)
-        self._log_confusion_matrix(
-            prefix + "combined", answerer, combined_truth[real], combined_answer[real], n_agents + 1, t_env
-        )
-
     def _log_confusion_matrix(self, question, answerer, truth, answer, n_answers, t_env):
         """Log one n_answers x n_answers confusion matrix, one number per cell, as
         cm_<question>_<answerer>_<truth>_<answer>.
 
-        question: the question's name with its prefix, for example "held_out_who".  answerer: "each",
-        "vote", "central" or "naive".  truth, answer: tensors of the same shape with whole numbers
-        0 .. n_answers - 1, one pair per graded answer.  t_env: the environment step to log at.
+        question: the question's name with its prefix, for example "held_out_who".  answerer: "each"
+        or "vote".  truth, answer: tensors of the same shape with whole numbers 0 .. n_answers - 1,
+        one pair per graded answer.  t_env: the environment step to log at.
         Each logged number says how often that truth met that answer."""
         # Give every (truth, answer) pair the number truth * n_answers + answer and count each number.
         # reshape(-1) lays a tensor out as one long row.
@@ -724,20 +577,11 @@ class QLearner:
         if self.mixer is not None:
             self.mixer.cuda()
             self.target_mixer.cuda()
-        if self.central is not None:
-            self.central.cuda()
 
     def save_models(self, path):
         self.mac.save_models(path)
         if self.mixer is not None:
             th.save(self.mixer.state_dict(), "{}/mixer.th".format(path))
-        if self.central is not None:
-            # saved before opt.th: run_long takes a checkpoint as complete once opt.th exists
-            central_state = {
-                "net": self.central.state_dict(),
-                "opt": self.central_optimiser.state_dict(),
-            }
-            th.save(central_state, "{}/central.th".format(path))
         th.save(self.optimiser.state_dict(), "{}/opt.th".format(path))
 
     def load_models(self, path):
@@ -757,10 +601,3 @@ class QLearner:
         self.optimiser.load_state_dict(
             th.load("{}/opt.th".format(path), map_location=lambda storage, loc: storage)
         )
-        central_path = "{}/central.th".format(path)
-        # Older checkpoints have no central.th: the centralised head then keeps its fresh weights.
-        # map_location="cpu" loads the saved tensors onto the CPU, like the lambda used above.
-        if self.central is not None and os.path.exists(central_path):
-            central_state = th.load(central_path, map_location="cpu")
-            self.central.load_state_dict(central_state["net"])
-            self.central_optimiser.load_state_dict(central_state["opt"])

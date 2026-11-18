@@ -29,7 +29,7 @@ COMMON_SETTINGS = [
     "test_interval=20000",
     "test_nepisode=20",
     "save_model=True",
-    "save_model_interval=100000",  # checkpoints for resume
+    "save_model_interval=100000",
 ]
 
 # The benchmark's hyperparameters of both jobs: Papoudakis et al. 2021, Table 28 (QMIX, LBF).

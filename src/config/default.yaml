@@ -60,3 +60,5 @@ split_backward: False # Cut the autograd graph at the per-agent utilities
 
 # --- Blame head options ---
 blame_head: False # give each agent the two blame heads, whether and who, alongside its Q head
+whether_threshold: 0.001
+whether_pos_weight: 4.0

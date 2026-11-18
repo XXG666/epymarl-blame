@@ -1,19 +1,17 @@
-"""The commands that manage runs: run, list, status, stop, resume, delete.
+"""The commands that manage runs: run, list, status, delete.
 
 Every cmd_... function takes args, the command line as argparse read it (see tools/run_long.py).
 rec is a run's record, the dictionary stored in the run's run.json (see jobs.py).
 """
 import json
-import os
 import re
 import shutil
-import signal
 import sys
 import time
 
 from .config import KINDS, RUNS_DIR, SACRED_DIR
-from .jobs import (commit_text, git_state, job_state, label, latest_checkpoint, launch, live_jobs, load_run,
-                   load_runs, read_json, run_dir, save_run, unique_ids)
+from .jobs import (commit_text, git_state, job_state, label, launch, live_jobs, load_run, read_json, run_dir,
+                   save_run, unique_ids)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -92,13 +90,25 @@ def job_cell(rec, kind, alive):
     return status
 
 
+def running_runs(recs, alive):
+    """In: a list of run records and the result of live_jobs(). Out: the records of the runs that have at
+    least one job running, in the same order."""
+    running = []
+    for rec in recs:
+        for kind in KINDS:
+            if label(rec["id"], kind) in alive:
+                running.append(rec)
+                break
+    return running
+
+
 def cmd_list(args):
-    """Print a table with one row per run. args is not used."""
-    recs = load_all_runs()
-    if len(recs) == 0:
-        print("no runs yet")
-        return
+    """Print a table with one row per run that is training right now. args is not used."""
     alive = live_jobs()
+    recs = running_runs(load_all_runs(), alive)
+    if len(recs) == 0:
+        print("no run is training right now")
+        return
 
     # the ID column is as wide as the longest ID, plus three spaces
     id_width = 0
@@ -192,74 +202,6 @@ def cmd_status(args):
 
 
 # ---------------------------------------------------------------------------------------------------------
-# stop
-# ---------------------------------------------------------------------------------------------------------
-
-def cmd_stop(args):
-    """Stop every running job of the runs args.ids."""
-    alive = live_jobs()
-    recs = load_runs(unique_ids(args.ids))
-    for rec in recs:
-        run_id = rec["id"]
-        stopped = 0
-        for kind in KINDS:
-            job_label = label(run_id, kind)
-            if job_label in alive:
-                # each job leads its own session: stop it and anything it started
-                os.killpg(alive[job_label], signal.SIGTERM)
-                stopped = stopped + 1
-        print(f"run {run_id}: stopped {stopped} job(s)")
-
-
-# ---------------------------------------------------------------------------------------------------------
-# resume
-# ---------------------------------------------------------------------------------------------------------
-
-def unfinished_jobs(recs, alive):
-    """In: a list of run records and the result of live_jobs(). Out: a list of (rec, kind), one entry for
-    every job that is neither running nor done."""
-    todo = []
-    for rec in recs:
-        for kind in KINDS:
-            status, steps = job_state(rec, kind, alive)
-            if status != "running" and status != "done":
-                todo.append((rec, kind))
-    return todo
-
-
-def cmd_resume(args):
-    """Start the unfinished jobs of the runs args.ids again: from their latest checkpoint, or from step 0
-    with args.from_scratch. Refuses if src/ is not what the run started with, unless args.force is set."""
-    alive = live_jobs()
-    recs = load_runs(unique_ids(args.ids))
-    todo = unfinished_jobs(recs, alive)
-    if len(todo) == 0:
-        print("nothing to resume: every job is running or done")
-        return
-
-    # a job that continues with different code is not the same experiment any more
-    commit, src_hash, dirty = git_state()
-    changed = []
-    for rec, kind in todo:
-        if rec["src"] != src_hash or rec["dirty"] != dirty:
-            if rec["id"] not in changed:
-                changed.append(rec["id"])
-    changed.sort()
-    if len(changed) > 0 and not args.force:
-        changed_ids = ", ".join(changed)
-        sys.exit(f"src/ changed since run {changed_ids} started; nothing resumed (--force to resume anyway)")
-
-    for rec, kind in todo:
-        run_id = rec["id"]
-        if args.from_scratch:
-            checkpoint = None
-        else:
-            checkpoint = latest_checkpoint(run_id, kind)
-        start_t = launch(rec, kind, resume_from=checkpoint)
-        print(f"run {run_id} {kind}: resumed from step {start_t:,}")
-
-
-# ---------------------------------------------------------------------------------------------------------
 # delete
 # ---------------------------------------------------------------------------------------------------------
 
@@ -270,7 +212,7 @@ def cmd_delete(args):
     alive = live_jobs()
     for kind in KINDS:
         if label(run_id, kind) in alive:
-            sys.exit(f"run {run_id} is still running; stop it first")
+            sys.exit(f"run {run_id} is still running")
     if not args.yes:
         typed = input(f"type {run_id} to delete it: ")
         if typed.strip() != run_id:

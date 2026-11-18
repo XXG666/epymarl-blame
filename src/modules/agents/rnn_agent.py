@@ -19,8 +19,8 @@ class RNNAgent(nn.Module):
         # Output per step: [ Q (n_actions) | whether (1) | who (n_agents) ]
         # The two blame sub-heads read the hidden state like the Q head.  The learner trains their output
         # at step t+1 on step t, so they judge a step with its outcome in view.
-        #   whether : one logit, "the team did clearly worse than predicted at step t"
-        #             (the TD error is above the batch's mean |TD error|)
+        #   whether : one logit, "the team did worse than predicted at step t by more than a fixed threshold"
+        #             (dL/dQ_tot is above the setting whether_threshold)
         #   who     : one logit per agent, "this agent has the largest mixer weight at step t"
         self.n_blame_outputs = args.n_blame_outputs
         if self.n_blame_outputs > 0:

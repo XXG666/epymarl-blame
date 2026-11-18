@@ -5,7 +5,7 @@ Words used in this file:
                 {metric name: {"steps": [...], "values": [...]}}
     series      one entry of metrics, {"steps": [...], "values": [...]}: a value at each of these steps
     question    what a head is asked: "whether", "who" or "combined" (LEGEND says what they mean)
-    answerer    who gives the answer: "each", "vote", "central" or "naive" (LEGEND again)
+    answerer    who gives the answer: "each" or "vote" (LEGEND again)
     matrix      a confusion matrix, as a list of rows: matrix[truth][answer] is how often the true answer
                 was truth and the given answer was answer. Training logs every cell as a metric of its own,
                 named cm_<set><question>_<answerer>_<truth>_<answer>, where <set> is "" for the training
@@ -40,16 +40,10 @@ QUESTION_TITLE = {"whether": "whether", "who": "who", "combined": "blame"}
 OLD_QUESTION_NAME = {"whether": "blame", "who": "importance"}
 
 # Who answered, as logged: every agent on its own, and the team's majority vote.
-AGENT_ANSWERERS = ["each", "vote"]
-
-# Shown after the agents' answers, when a run has them, by the names they are logged with:
-# "central" is the centralised head (the upper limit), "naive" is the naive method (random guesses).
-EXTRA_ANSWERERS = ["central", "naive"]
-
-ALL_ANSWERERS = AGENT_ANSWERERS + EXTRA_ANSWERERS
+ANSWERERS = ["each", "vote"]
 
 # The answerers as shown in the table and the plot.
-ANSWERER_LABEL = {"each": "each", "vote": "maj", "central": "baseline", "naive": "naive"}
+ANSWERER_LABEL = {"each": "each", "vote": "maj"}
 
 # The three numbers of a score.
 MEASURES = ["accuracy", "sensitivity", "specificity"]
@@ -59,14 +53,12 @@ TRAINING_PREFIX = ""
 HELD_OUT_PREFIX = "held_out_"
 
 # The plot: the line of each job in the return panel.
-GREY = "#8a8984"
-JOB_COLOUR = {"qmix": GREY, "blame": "#2a78d6"}
+JOB_COLOUR = {"qmix": "#8a8984", "blame": "#2a78d6"}
 JOB_LINE_STYLE = {"qmix": "--", "blame": "-"}
 JOB_LABEL = {"qmix": "benchmark QMIX", "blame": "blame QMIX"}
 
-# The plot: the agents' line in the panels of each question, and the grey lines of the extra answerers.
+# The plot: the agents' line in the panels of each question.
 QUESTION_COLOUR = {"whether": "#e87ba4", "who": "#eda100", "combined": "#1baf7a"}
-EXTRA_LINE_STYLE = {"central": "--", "naive": ":"}
 
 # The table: how many characters each column is wide. The column of the run's ID depends on the IDs.
 SEED_WIDTH = 6
@@ -83,20 +75,16 @@ QUESTION_SUBTITLE = {"whether": "acc    sens/spec", "who": "acc", "combined": "a
 LEGEND = [
     "   pooled over the second half of each job's steps",
     "   return     = test return (1.0 = all food collected)",
-    ("   whether    = did the step go clearly worse than predicted (1) or not (0): "
-     + "TD error above the batch's mean |TD error|;  who = which agent has the largest mixer weight"),
+    ("   whether    = did the step go worse than predicted by more than the threshold (1) or not (0): "
+     + "dL/dQ_tot above whether_threshold;  who = which agent has the largest mixer weight"),
     "   blame      = the final answer: the agent named by who if whether says yes, else nobody",
     "   each       = every agent's own answer;  maj = the team's majority vote",
-    ("   baseline   = the upper limit: "
-     + "a centralised head that reads the global state and all agents' hidden states"),
-    ("   naive      = the naive method: "
-     + "yes or no to whether with probability 1/2, and for who each agent with equal probability"),
     "                all graded on the held-out test episodes (epsilon 0.05), which nothing is trained on;",
     ("                (train) = graded on the training batches instead, "
      + "because a run in this summary has no held-out data"),
     "   acc        = accuracy: the share of answers that are right",
     ("   sens/spec  = sensitivity / specificity of the whether answer "
-     + "(answer 1, clearly worse than predicted, is the positive)"),
+     + "(answer 1, worse than predicted by more than the threshold, is the positive)"),
     "   *  still running (not final)    !  stopped or crashed",
 ]
 
@@ -332,7 +320,7 @@ def grade_run(rec, alive, held_out):
     for question in QUESTIONS:
         result["scores"][question] = {}
         result["curves"][question] = {}
-        for answerer in ALL_ANSWERERS:
+        for answerer in ANSWERERS:
             score, curve = grade_question(metrics, question, answerer, set_prefix, first_late_step)
             result["scores"][question][answerer] = score
             result["curves"][question][answerer] = curve
@@ -345,22 +333,6 @@ def grade_runs(recs, held_out):
     for rec in recs:
         results.append(grade_run(rec, live_jobs(), held_out))
     return results
-
-
-def extras_to_show(results):
-    """The baseline and the naive method are shown in the MEAN and the plot only if every run with head data
-    has them. In: the runs' results. Out: the list of the extra answerers that pass this test."""
-    shown = []
-    for answerer in EXTRA_ANSWERERS:
-        every_run_has_it = True
-        for result in results:
-            if result["set"] is None:
-                continue  # a run with no head data at all does not count
-            if len(result["curves"]["whether"][answerer]["steps"]) == 0:
-                every_run_has_it = False
-        if every_run_has_it:
-            shown.append(answerer)
-    return shown
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -405,16 +377,6 @@ def score_cell(question, score):
     return accuracy_text.ljust(QUESTION_WIDTH[question])
 
 
-def has_no_scores(scores, answerer):
-    """In: scores[question][answerer] and an answerer. Out: True if every measure of every question is
-    missing (nan) for this answerer."""
-    for question in QUESTIONS:
-        for measure in MEASURES:
-            if not math.isnan(scores[question][answerer][measure]):
-                return False
-    return True
-
-
 def score_lines(left, id_width, scores, note):
     """The table lines of one run, or of the MEAN: one line per answerer.
     In: left = the text of the five left columns, which only the first line shows; the width of the ID
@@ -422,9 +384,7 @@ def score_lines(left, id_width, scores, note):
     Out: a list of strings."""
     blank = left_columns("", "", "", "", "", id_width)
     lines = []
-    for answerer in ALL_ANSWERERS:
-        if answerer in EXTRA_ANSWERERS and has_no_scores(scores, answerer):
-            continue  # a run from before the baseline or the naive method
+    for answerer in ANSWERERS:
         if len(lines) == 0:
             line = "   " + left
         else:
@@ -468,9 +428,9 @@ def mean_score(results, question, answerer):
     return score
 
 
-def mean_lines(results, shown, id_width, note):
-    """In: the runs' results, the extra answerers to show, the width of the ID column and the note for the
-    answerers' labels. Out: the MEAN lines of the table, as a list of strings."""
+def mean_lines(results, id_width, note):
+    """In: the runs' results, the width of the ID column and the note for the answerers' labels.
+    Out: the MEAN lines of the table, as a list of strings."""
     qmix_returns = []
     blame_returns = []
     for result in results:
@@ -482,13 +442,8 @@ def mean_lines(results, shown, id_width, note):
     scores = {}
     for question in QUESTIONS:
         scores[question] = {}
-        for answerer in ALL_ANSWERERS:
-            # An extra answerer that some run lacks gets no MEAN line: an empty score makes score_lines
-            # leave its line out.
-            if answerer in AGENT_ANSWERERS or answerer in shown:
-                scores[question][answerer] = mean_score(results, question, answerer)
-            else:
-                scores[question][answerer] = empty_score()
+        for answerer in ANSWERERS:
+            scores[question][answerer] = mean_score(results, question, answerer)
 
     qmix_text = f"{qmix_return:.3f}"
     blame_text = f"{blame_return:.3f}"
@@ -496,8 +451,8 @@ def mean_lines(results, shown, id_width, note):
     return score_lines(left, id_width, scores, note)
 
 
-def table_lines(results, title, note, shown):
-    """In: the runs' results, the title, the note for the answerers' labels and the extra answerers to show.
+def table_lines(results, title, note):
+    """In: the runs' results, the title and the note for the answerers' labels.
     Out: everything the summary prints, as a list of lines: the title, the table and the legend."""
     # the ID column has room for the longest ID and its marks
     id_width = 0
@@ -510,7 +465,7 @@ def table_lines(results, title, note, shown):
     for result in results:
         lines.extend(run_lines(result, id_width, note))
     if len(results) > 1:
-        lines.extend(mean_lines(results, shown, id_width, note))
+        lines.extend(mean_lines(results, id_width, note))
     lines.append("")
     lines.extend(LEGEND)
     return lines
@@ -520,12 +475,13 @@ def table_lines(results, title, note, shown):
 # The plot
 # ---------------------------------------------------------------------------------------------------------
 
-def draw_band(panel, series_list, colour, style, label, width):
+def draw_band(panel, series_list, colour, style, label):
     """Draw the mean of several series as a line and their min-max range as a shaded band.
     The series are put on a common grid first (linear interpolation; a run contributes only where it has
     data).
     In: the panel to draw in, a list of series {"steps": [...], "values": [...]} (one per run), and the
-    line's colour, style, label for the legend and width. Draws nothing if every series is empty."""
+    line's colour, style and label for the legend (None for a line without one). Draws nothing if every
+    series is empty."""
     with_data = []
     for series in series_list:
         if len(series["steps"]) > 0:
@@ -551,7 +507,7 @@ def draw_band(panel, series_list, colour, style, label, width):
     rows = rows[:, some_run_has_data]
 
     mean_line = np.nanmean(rows, axis=0)
-    panel.plot(grid, mean_line, color=colour, linestyle=style, linewidth=width, label=label)
+    panel.plot(grid, mean_line, color=colour, linestyle=style, linewidth=1.5, label=label)
     if len(with_data) > 1:
         lowest = np.nanmin(rows, axis=0)
         highest = np.nanmax(rows, axis=0)
@@ -559,7 +515,7 @@ def draw_band(panel, series_list, colour, style, label, width):
 
 
 def panel_name(question, answerer):
-    """Out: the name of the plot's panel that shows one question answered by one of the agents' answerers."""
+    """Out: the name of the plot's panel that shows one question answered by one answerer."""
     return f"{question}_{answerer}"
 
 
@@ -577,25 +533,18 @@ def draw_returns(panel, results):
         series_list = []
         for result in results:
             series_list.append(logged_series(result[kind]["metrics"], "test_return_mean"))
-        draw_band(panel, series_list, JOB_COLOUR[kind], JOB_LINE_STYLE[kind], JOB_LABEL[kind], 1.5)
+        draw_band(panel, series_list, JOB_COLOUR[kind], JOB_LINE_STYLE[kind], JOB_LABEL[kind])
     panel.set_title("test return")
 
 
-def draw_accuracies(panel, results, question, answerer, shown):
-    """In: a panel, the runs' results, the panel's question and answerer, and the extra answerers to show.
-    Draws the accuracy of the agents' answers (colour), and of the baseline (grey dashed) and the naive
-    method (grey dotted) if they are shown, and the panel's title."""
+def draw_accuracies(panel, results, question, answerer):
+    """In: a panel, the runs' results, and the panel's question and answerer.
+    Draws the accuracy of the agents' answers and the panel's title."""
     series_list = []
     for result in results:
         series_list.append(result["curves"][question][answerer])
-    draw_band(panel, series_list, QUESTION_COLOUR[question], "-", "agents", 1.5)
-
-    for extra in EXTRA_ANSWERERS:
-        if extra in shown:
-            series_list = []
-            for result in results:
-                series_list.append(result["curves"][question][extra])
-            draw_band(panel, series_list, GREY, EXTRA_LINE_STYLE[extra], ANSWERER_LABEL[extra], 1.2)
+    # None: the panel's title says what the line is, so it needs no legend
+    draw_band(panel, series_list, QUESTION_COLOUR[question], "-", None)
 
     question_title = QUESTION_TITLE[question]
     answerer_label = ANSWERER_LABEL[answerer]
@@ -606,7 +555,7 @@ def panel_layout():
     """Out: the grid of panel names for the plot, one list per row. The return panel is named in the
     first place of both rows, so it fills the left of the picture over both rows."""
     layout = []
-    for answerer in AGENT_ANSWERERS:
+    for answerer in ANSWERERS:
         layout_row = ["return"]
         for question in QUESTIONS:
             layout_row.append(panel_name(question, answerer))
@@ -614,12 +563,12 @@ def panel_layout():
     return layout
 
 
-def plot(results, path, title, graded, shown):
+def plot(results, path, title, graded):
     """Left: test return of both jobs. Right: a panel per question (columns) and answerer (rows) with the
-    accuracy on the graded episodes (colour), the baseline (grey dashed) and the naive method (grey dotted).
+    agents' accuracy on the graded episodes.
     Lines are the mean over the runs, bands their min-max range.
-    In: the runs' results, the path of the picture to write, the title, the set the heads are graded on
-    ("held-out" or "training"), and the extra answerers to show."""
+    In: the runs' results, the path of the picture to write, the title, and the set the heads are graded on
+    ("held-out" or "training")."""
     layout = panel_layout()
     # the return panel is twice as wide as the accuracy panel of a question
     width_ratios = [2]
@@ -629,9 +578,9 @@ def plot(results, path, title, graded, shown):
 
     draw_returns(panels["return"], results)
     for question in QUESTIONS:
-        for answerer in AGENT_ANSWERERS:
+        for answerer in ANSWERERS:
             panel = panels[panel_name(question, answerer)]
-            draw_accuracies(panel, results, question, answerer, shown)
+            draw_accuracies(panel, results, question, answerer)
     # the panels share the step axis: this starts all of them at step 0
     panels["return"].set_xlim(left=0)
 
@@ -642,15 +591,12 @@ def plot(results, path, title, graded, shown):
         panel.xaxis.set_major_formatter(steps_in_millions)
 
     # the panels share the step axis: only the bottom ones name it
-    bottom_answerer = AGENT_ANSWERERS[-1]
+    bottom_answerer = ANSWERERS[-1]
     panels["return"].set_xlabel("environment steps")
     for question in QUESTIONS:
         panels[panel_name(question, bottom_answerer)].set_xlabel("environment steps")
 
-    # the lines mean the same in every accuracy panel: one legend is enough for them
-    first_accuracy_panel = panel_name(QUESTIONS[0], AGENT_ANSWERERS[0])
     panels["return"].legend(fontsize=8, frameon=False)
-    panels[first_accuracy_panel].legend(fontsize=8, frameon=False)
 
     run_count = len(results)
     if run_count == 1:
@@ -669,10 +615,10 @@ def plot(results, path, title, graded, shown):
 # ---------------------------------------------------------------------------------------------------------
 
 def summary(recs, folder, title):
-    """Print and save one table (per run: each agent's answers, the team's majority vote, the baseline and
-    the naive method, graded on the held-out test episodes; plus their MEAN if there are several runs) and
-    the plot. If some of the runs have no held-out data, all of them are graded on their training batches
-    instead, so that the MEAN and the plot compare like with like.
+    """Print and save one table (per run: each agent's answers and the team's majority vote, graded on the
+    held-out test episodes; plus their MEAN if there are several runs) and the plot. If some of the runs
+    have no held-out data, all of them are graded on their training batches instead, so that the MEAN and
+    the plot compare like with like.
     In: a list of run records, the folder to save in, and the title. Out: the list of the runs' results."""
     results = grade_runs(recs, True)  # True: on held-out episodes where a run has them
     some_run_is_held_out = False
@@ -691,14 +637,13 @@ def summary(recs, folder, title):
     else:
         graded = "training"
         note = " (train)"
-    shown = extras_to_show(results)
 
-    text = "\n".join(table_lines(results, title, note, shown))
+    text = "\n".join(table_lines(results, title, note))
     print(text)
 
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "summary.txt").write_text(text + "\n")
-    plot(results, folder / "summary.png", title, graded, shown)
+    plot(results, folder / "summary.png", title, graded)
     relative_folder = folder.relative_to(ROOT)
     print(f"\nsaved in {relative_folder}/")
     return results
